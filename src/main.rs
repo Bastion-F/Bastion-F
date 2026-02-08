@@ -14,7 +14,7 @@ use std::io::{Read, Write};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 type HkdfSha256 = Hmac<Sha256>;
-const MAGIC_BYTES: &[u8; 8] = b"BASTION1";
+const MAGIC_BYTES: &[u8; 8] = b"BASTION1"; // Watermark
 
 fn read_password_masked(prompt: &str) -> Result<String> {
     let term = Term::stdout();
