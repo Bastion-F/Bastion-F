@@ -38,6 +38,9 @@ We welcome:
 
 This project is written in Rust and requires a recent stable toolchain.
 
+Note that you can download compiled Bastion here: [Download Bastion.exe v0.0.2](https://github.com/Bastion-F/Bastion-F/releases/download/v0.0.2/bastion_f.exe)
+
+
 ### Requirements
 
 * Rust 1.70+ (stable)
