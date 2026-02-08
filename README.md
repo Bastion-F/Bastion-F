@@ -1,3 +1,6 @@
+
+![Bastion-F Banner](src/banner.png)
+
 # 🛡️ Bastion-F
 
 **Experimental ARX-based file encryption tool written in Rust.**
