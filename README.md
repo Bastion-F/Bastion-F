@@ -1,5 +1,12 @@
 
-![Bastion-F Banner](src/banner.png)
+<p align="center">
+  <img src="src/banner.png" width="800">
+</p>
+
+<h3 align="center">
+🛡️ Experimental ARX-based encryption • Cryptanalysis Wanted
+</h3>
+
 
 # 🛡️ Bastion-F
 
