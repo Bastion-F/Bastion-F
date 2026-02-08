@@ -3,14 +3,15 @@ use argon2::Argon2;
 use clap::Parser;
 use console::{Key, Term};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
-use hmac::{Hmac, Mac};
+use hkdf::Hkdf;
+use hmac::Hmac;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use lz4_flex::{compress_prepend_size, decompress_size_prepended};
 use rand::{rngs::OsRng, RngCore};
 use rayon::prelude::*;
 use sha2::Sha256;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{Read, Write, Seek};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 type HkdfSha256 = Hmac<Sha256>;
