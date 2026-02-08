@@ -42,7 +42,7 @@ fn read_password_masked(prompt: &str) -> Result<String> {
     }
     Ok(password)
 }
--
+
 fn style_spinner(pb: ProgressBar, msg: &'static str) -> ProgressBar {
     pb.set_style(ProgressStyle::default_spinner()
         .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
