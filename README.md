@@ -17,7 +17,7 @@ Custom cipher (Bastion-256). Open design. Cryptanalysis welcome.
 
 ## ⚠️ Cryptanalysis Wanted
 
-Bastion-256 is an **experimental ARX-based stream cipher** designed for
+Bastion-F is an **experimental ARX-based stream cipher** designed for
 educational and research purposes.
 
 This project **actively invites cryptanalysis**.
@@ -38,7 +38,7 @@ We welcome:
 
 This project is written in Rust and requires a recent stable toolchain.
 
-Note that you can download compiled Bastion here: [Download Bastion.exe v0.0.2](https://github.com/Bastion-F/Bastion-F/releases/download/v0.0.2/bastion_f.exe)
+Note that you can download compiled Bastion here: [Download Bastion.exe v0.0.3](https://github.com/Bastion-F/Bastion-F/releases/download/v0.0.3/bastion_f.exe)
 
 
 ### Requirements
@@ -107,7 +107,7 @@ log-structured file systems.
 
 ```text
 $ bastion-f --encrypt --path notes.md
-🛡️  Bastion-F v0.0.2 | Terminal
+🛡️  Bastion-F v0.0.3 | Terminal
 🔑 Enter a master-key: ********
 ⠁ Reading & Compressing... [00:00:00]
 🗜️  Compression finished.
@@ -121,7 +121,7 @@ $ bastion-f --encrypt --path notes.md
 
 ```text
 $ bastion-f --decrypt --path notes.md.bastion
-🛡️  Bastion-F v0.0.2 | Terminal
+🛡️  Bastion-F v0.0.3 | Terminal
 🔑 Enter a master-key: ********
 ⠁ Reconstructing keys... [00:00:00]
 🔑 Keys reconstructed.
@@ -134,7 +134,7 @@ $ bastion-f --decrypt --path notes.md.bastion
 
 ## Security Notes
 
-* Bastion-256 is **not** a replacement for AES or ChaCha20
+* Bastion-F is **not** a replacement for AES or ChaCha20
 * The cipher has not undergone extensive public cryptanalysis
 * Use for experimentation, learning, and research only
 
