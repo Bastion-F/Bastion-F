@@ -13,7 +13,7 @@ pub const RED: &str = "\x1b[38;5;167m";
 
 pub fn print_banner(cwd: &str) {
     println!();
-    println!("  {ACCENT}▐▛███▜▌{RESET}    {BOLD}{TEXT}knox{RESET} {MUTED}v0.2.0{RESET}");
+    println!("  {ACCENT}▐▛███▜▌{RESET}    {BOLD}{TEXT}knox{RESET} {MUTED}v0.5.1{RESET}");
     println!("  {ACCENT}▜█████▛▘{RESET}   {MUTED}KNOX-256 · Argon2id · HKDF-SHA256 · HMAC{RESET}");
     println!("   {ACCENT}▘▘ ▝▝{RESET}     {MUTED}16 rounds · 256-bit key · {cwd}{RESET}");
     println!();
