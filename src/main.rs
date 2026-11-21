@@ -260,8 +260,15 @@ fn run_bench() {
     for _ in 0..blocks {
         block = cipher.encrypt_block(block, tweak);
     }
-    let elapsed = start.elapsed();
-    let mib_s = ((blocks * 16) as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64();
+    let single_elapsed = start.elapsed();
+    let single_mib = ((blocks * 16) as f64 / (1024.0 * 1024.0)) / single_elapsed.as_secs_f64();
+
+    let mut buf = vec![0x42u8; 64 * 1024 * 1024];
+    let par_start = Instant::now();
+    crypto::do_ctr(&cipher, &tweak, &mut buf);
+    let par_elapsed = par_start.elapsed();
+    let par_mib = 64.0 / par_elapsed.as_secs_f64();
+    let threads = rayon::current_num_threads();
 
     let mut flips = 0u64;
     for i in 0..256u16 {
@@ -278,10 +285,15 @@ fn run_bench() {
     }
     let avg = (flips as f64) / (256.0 * 128.0) * 100.0;
 
-    ui::print_op("bench", "KNOX-256 raw block core (16 rounds)");
-    ui::print_line("throughput", &format!("{mib_s:.1} MiB/s ({blocks} blocks)"), false);
+    ui::print_op("bench", "KNOX-256 T-table core (16 rounds)");
+    ui::print_line("1-thread", &format!("{single_mib:.1} MiB/s ({blocks} blocks)"), false);
+    ui::print_line(
+        "parallel",
+        &format!("{par_mib:.1} MiB/s (64 MiB on {threads} threads)"),
+        false,
+    );
     ui::print_line("avalanche", &format!("{avg:.2}% bit flip per 1-bit delta"), false);
-    ui::print_done("checksum", &crypto::hex_short(&block), elapsed);
+    ui::print_done("checksum", &crypto::hex_short(&block), single_elapsed + par_elapsed);
 }
 
 fn get_cwd() -> String {
