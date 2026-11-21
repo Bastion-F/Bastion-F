@@ -5,8 +5,8 @@ mod ui;
 
 use crypto::cipher::Knox256;
 use std::env;
-use std::fs;
-use std::io::{self, BufRead, Write};
+use std::fs::{self, File};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 use std::time::Instant;
 use zeroize::Zeroizing;
@@ -135,6 +135,16 @@ fn ask_pass(confirm: bool) -> Result<Zeroizing<String>, String> {
     Ok(p1)
 }
 
+fn same_path(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(pa), Ok(pb)) => pa == pb,
+        _ => false,
+    }
+}
+
 fn run_enc(args: &[String]) -> Result<(), String> {
     if args.is_empty() {
         return Err("usage: enc <file> [out]".to_string());
@@ -146,27 +156,51 @@ fn run_enc(args: &[String]) -> Result<(), String> {
         format!("{input_path}.knx")
     };
 
-    let raw = fs::read(input_path).map_err(|e| format!("cannot read '{input_path}': {e}"))?;
-    let data = Zeroizing::new(raw);
+    if same_path(input_path, &output_path) {
+        return Err("input and output paths must be different".to_string());
+    }
+
+    let in_file = File::open(input_path).map_err(|e| format!("cannot open '{input_path}': {e}"))?;
     let pass = ask_pass(true)?;
 
+    let out_file =
+        File::create(&output_path).map_err(|e| format!("cannot create '{output_path}': {e}"))?;
+
+    let mut reader = BufReader::with_capacity(256 * 1024, in_file);
+    let mut writer = BufWriter::with_capacity(256 * 1024, out_file);
+
     let start = Instant::now();
-    let (sealed, tag) = crypto::seal(&data, &pass)?;
-    fs::write(&output_path, &sealed).map_err(|e| format!("cannot write '{output_path}': {e}"))?;
+    let res = crypto::seal_stream(&mut reader, &mut writer, &pass);
+    let stats = match res {
+        Ok(s) => s,
+        Err(e) => {
+            drop(writer);
+            let _ = fs::remove_file(&output_path);
+            return Err(e);
+        }
+    };
+
+    writer
+        .flush()
+        .map_err(|e| format!("cannot flush '{output_path}': {e}"))?;
 
     ui::print_op("enc", &format!("{input_path} → {output_path}"));
-    ui::print_line("cipher", "KNOX-256 + Argon2id + HKDF + HMAC-SHA256", false);
+    ui::print_line("cipher", "KNOX-256 + Argon2id + BLAKE3 STREAM", false);
     ui::print_line(
         "size",
         &format!(
-            "{} → {} (+{} B overhead)",
-            ui::format_bytes(data.len()),
-            ui::format_bytes(sealed.len()),
-            crypto::HEADER_LEN + crypto::TAG_LEN
+            "{} → {} ({} chunks)",
+            ui::format_bytes(stats.bytes_in),
+            ui::format_bytes(stats.bytes_out),
+            stats.chunks
         ),
         false,
     );
-    ui::print_done("tag", &format!("{} (sealed)", crypto::hex_short(&tag)), start.elapsed());
+    ui::print_done(
+        "hdr-mac",
+        &format!("{} (sealed)", crypto::hex_short(&stats.header_mac)),
+        start.elapsed(),
+    );
     Ok(())
 }
 
@@ -183,20 +217,51 @@ fn run_dec(args: &[String]) -> Result<(), String> {
         format!("{input_path}.dec")
     };
 
-    let blob = fs::read(input_path).map_err(|e| format!("cannot read '{input_path}': {e}"))?;
+    if same_path(input_path, &output_path) {
+        return Err("input and output paths must be different".to_string());
+    }
+
+    let in_file = File::open(input_path).map_err(|e| format!("cannot open '{input_path}': {e}"))?;
+    let mut reader = BufReader::with_capacity(256 * 1024, in_file);
     let pass = ask_pass(false)?;
 
     let start = Instant::now();
-    let (plain, tag) = crypto::open(&blob, &pass)?;
-    fs::write(&output_path, &*plain).map_err(|e| format!("cannot write '{output_path}': {e}"))?;
+    let unlocked = crypto::unlock_header(&mut reader, &pass)?;
+
+    let out_file =
+        File::create(&output_path).map_err(|e| format!("cannot create '{output_path}': {e}"))?;
+    let mut writer = BufWriter::with_capacity(256 * 1024, out_file);
+
+    let res = crypto::open_payload(&mut reader, &mut writer, &unlocked);
+    let stats = match res {
+        Ok(s) => s,
+        Err(e) => {
+            drop(writer);
+            let _ = fs::remove_file(&output_path);
+            return Err(e);
+        }
+    };
+
+    writer
+        .flush()
+        .map_err(|e| format!("cannot flush '{output_path}': {e}"))?;
 
     ui::print_op("dec", &format!("{input_path} → {output_path}"));
     ui::print_line(
         "size",
-        &format!("{} → {}", ui::format_bytes(blob.len()), ui::format_bytes(plain.len())),
+        &format!(
+            "{} → {} ({} chunks)",
+            ui::format_bytes(stats.bytes_in),
+            ui::format_bytes(stats.bytes_out),
+            stats.chunks
+        ),
         false,
     );
-    ui::print_done("tag", &format!("{} (verified)", crypto::hex_short(&tag)), start.elapsed());
+    ui::print_done(
+        "hdr-mac",
+        &format!("{} (verified)", crypto::hex_short(&stats.header_mac)),
+        start.elapsed(),
+    );
     Ok(())
 }
 
@@ -206,30 +271,31 @@ fn run_seal(text: &str) -> Result<(), String> {
     }
     let pass = ask_pass(true)?;
     let start = Instant::now();
-    let (sealed, tag) = crypto::seal(text.as_bytes(), &pass)?;
-    let token = format!("knx2:{}", crypto::b64_encode(&sealed));
+    let (sealed, mac) = crypto::seal_bytes(text.as_bytes(), &pass)?;
+    let token = format!("knx3:{}", crypto::b64_encode(&sealed));
 
     ui::print_op("seal", &format!("{} bytes armored", text.len()));
     ui::print_line("token", &token, false);
-    ui::print_done("tag", &crypto::hex_short(&tag), start.elapsed());
+    ui::print_done("hdr-mac", &crypto::hex_short(&mac), start.elapsed());
     Ok(())
 }
 
 fn run_open(token: &str) -> Result<(), String> {
-    let payload = match token.strip_prefix("knx2:") {
+    let payload = match token.strip_prefix("knx3:") {
         Some(p) => p,
-        None => return Err("expected token starting with 'knx2:'".to_string()),
+        None => return Err("expected token starting with 'knx3:'".to_string()),
     };
     let raw = crypto::b64_decode(payload)?;
     let pass = ask_pass(false)?;
 
     let start = Instant::now();
-    let (plain, tag) = crypto::open(&raw, &pass)?;
-    let text = std::str::from_utf8(&plain).map_err(|_| "decrypted data is not valid UTF-8".to_string())?;
+    let (plain, mac) = crypto::open_bytes(&raw, &pass)?;
+    let text = std::str::from_utf8(&plain)
+        .map_err(|_| "decrypted data is not valid UTF-8".to_string())?;
 
     ui::print_op("open", "armored token verified");
     ui::print_line("output", text, false);
-    ui::print_done("tag", &crypto::hex_short(&tag), start.elapsed());
+    ui::print_done("hdr-mac", &crypto::hex_short(&mac), start.elapsed());
     Ok(())
 }
 
@@ -238,15 +304,23 @@ fn run_info(args: &[String]) -> Result<(), String> {
         return Err("usage: info <file.knx>".to_string());
     }
     let path = &args[0];
-    let blob = fs::read(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
-    let info = crypto::inspect(&blob)?;
+    let meta = fs::metadata(path).map_err(|e| format!("cannot stat '{path}': {e}"))?;
+    let mut file = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
+    let info = crypto::inspect_reader(&mut file)?;
+
+    let body_len = meta.len().saturating_sub(crypto::HEADER_LEN as u64);
+    let chunks = (body_len + (crypto::ENC_CHUNK_SIZE as u64) - 1) / (crypto::ENC_CHUNK_SIZE as u64);
 
     ui::print_op("info", path);
-    ui::print_line("format", &format!("KNOX v{}", info.version), false);
-    ui::print_line("payload", &ui::format_bytes(info.payload_len), false);
+    ui::print_line("format", &format!("KNOX v{} (BLAKE3 STREAM)", info.version), false);
+    ui::print_line(
+        "file",
+        &format!("{} (~{} chunks)", ui::format_bytes(meta.len()), chunks),
+        false,
+    );
     ui::print_line("salt", &crypto::hex_short(&info.salt), false);
-    ui::print_line("nonce", &crypto::hex_short(&info.nonce), false);
-    ui::print_line("tag", &crypto::hex_short(&info.tag), true);
+    ui::print_line("nonce", &crypto::hex_short(&info.stream_nonce), false);
+    ui::print_line("hdr-mac", &crypto::hex_short(&info.header_mac), true);
     Ok(())
 }
 
@@ -263,11 +337,11 @@ fn run_bench() {
     let single_elapsed = start.elapsed();
     let single_mib = ((blocks * 16) as f64 / (1024.0 * 1024.0)) / single_elapsed.as_secs_f64();
 
-    let mut buf = vec![0x42u8; 64 * 1024 * 1024];
-    let par_start = Instant::now();
-    crypto::do_ctr(&cipher, &tweak, &mut buf);
-    let par_elapsed = par_start.elapsed();
-    let par_mib = 64.0 / par_elapsed.as_secs_f64();
+    let buf = vec![0x42u8; 64 * 1024 * 1024];
+    let stream_start = Instant::now();
+    let last_tag = crypto::bench_stream_pipeline(&buf);
+    let stream_elapsed = stream_start.elapsed();
+    let stream_mib = 64.0 / stream_elapsed.as_secs_f64();
     let threads = rayon::current_num_threads();
 
     let mut flips = 0u64;
@@ -285,15 +359,19 @@ fn run_bench() {
     }
     let avg = (flips as f64) / (256.0 * 128.0) * 100.0;
 
-    ui::print_op("bench", "KNOX-256 T-table core (16 rounds)");
+    ui::print_op("bench", "KNOX-256 + BLAKE3 STREAM (64 KiB chunks)");
     ui::print_line("1-thread", &format!("{single_mib:.1} MiB/s ({blocks} blocks)"), false);
     ui::print_line(
-        "parallel",
-        &format!("{par_mib:.1} MiB/s (64 MiB on {threads} threads)"),
+        "stream",
+        &format!("{stream_mib:.1} MiB/s (64 MiB enc+MAC on {threads} threads)"),
         false,
     );
     ui::print_line("avalanche", &format!("{avg:.2}% bit flip per 1-bit delta"), false);
-    ui::print_done("checksum", &crypto::hex_short(&block), single_elapsed + par_elapsed);
+    ui::print_done(
+        "checksum",
+        &format!("{} · {}", crypto::hex_short(&block), crypto::hex_short(&last_tag)),
+        single_elapsed + stream_elapsed,
+    );
 }
 
 fn get_cwd() -> String {
