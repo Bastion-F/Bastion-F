@@ -4,6 +4,7 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use cipher::Knox256;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
+use rayon::prelude::*;
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
@@ -16,6 +17,9 @@ pub const TAG_LEN: usize = 32;
 const ARGON_MEM_KIB: u32 = 65536;
 const ARGON_ITERS: u32 = 3;
 const ARGON_LANES: u32 = 1;
+
+const PAR_THRESHOLD: usize = 64 * 1024;
+const PAR_CHUNK: usize = 16 * 1024;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -56,25 +60,47 @@ fn derive_keys(
     Ok((enc_key, mac_key))
 }
 
-fn do_ctr(cipher: &Knox256, nonce: &[u8; 16], data: &mut [u8]) {
+fn ctr_range(
+    cipher: &Knox256,
+    nonce: &[u8; 16],
+    nonce_lo: u64,
+    start_block: u64,
+    data: &mut [u8],
+) {
+    for (i, chunk) in data.chunks_mut(16).enumerate() {
+        let idx = start_block + (i as u64);
+        let mut ctr = [0u8; 16];
+        ctr[0..8].copy_from_slice(&idx.to_le_bytes());
+        ctr[8..16].copy_from_slice(&nonce[8..16]);
+
+        let mut tweak = *nonce;
+        let tw_lo = nonce_lo.wrapping_add(idx) ^ 0x0100_0000_0000_0000;
+        tweak[0..8].copy_from_slice(&tw_lo.to_le_bytes());
+
+        let ks = cipher.encrypt_block(ctr, tweak);
+        for j in 0..chunk.len() {
+            chunk[j] ^= ks[j];
+        }
+    }
+}
+
+pub fn do_ctr(cipher: &Knox256, nonce: &[u8; 16], data: &mut [u8]) {
     let mut base_lo = [0u8; 8];
     base_lo.copy_from_slice(&nonce[0..8]);
     let nonce_lo = u64::from_le_bytes(base_lo);
 
-    for (idx, chunk) in data.chunks_mut(16).enumerate() {
-        let mut ctr = [0u8; 16];
-        ctr[0..8].copy_from_slice(&(idx as u64).to_le_bytes());
-        ctr[8..16].copy_from_slice(&nonce[8..16]);
-
-        let mut tweak = *nonce;
-        let tw_lo = nonce_lo.wrapping_add(idx as u64) ^ 0x0100_0000_0000_0000;
-        tweak[0..8].copy_from_slice(&tw_lo.to_le_bytes());
-
-        let ks = cipher.encrypt_block(ctr, tweak);
-        for i in 0..chunk.len() {
-            chunk[i] ^= ks[i];
-        }
+    if data.len() < PAR_THRESHOLD {
+        ctr_range(cipher, nonce, nonce_lo, 0, data);
+        return;
     }
+
+    let blocks_per_chunk = (PAR_CHUNK / 16) as u64;
+    data.par_chunks_mut(PAR_CHUNK)
+        .enumerate()
+        .for_each(|(chunk_idx, slice)| {
+            let start_block = (chunk_idx as u64) * blocks_per_chunk;
+            ctr_range(cipher, nonce, nonce_lo, start_block, slice);
+        });
 }
 
 fn make_tag(mac_key: &[u8; 32], header: &[u8], ct: &[u8]) -> [u8; TAG_LEN] {
@@ -244,6 +270,23 @@ mod tests {
 
         sealed[HEADER_LEN + 2] ^= 1;
         assert!(open(&sealed, "secret-pass").is_err());
+    }
+
+    #[test]
+    fn test_parallel_ctr_matches_single() {
+        let cipher = Knox256::new(&[0x33u8; 32]);
+        let nonce = [0x99u8; 16];
+        let mut base_lo = [0u8; 8];
+        base_lo.copy_from_slice(&nonce[0..8]);
+        let nonce_lo = u64::from_le_bytes(base_lo);
+
+        let mut single = vec![0x5Au8; 100_013];
+        let mut parallel = single.clone();
+
+        ctr_range(&cipher, &nonce, nonce_lo, 0, &mut single);
+        do_ctr(&cipher, &nonce, &mut parallel);
+
+        assert_eq!(single, parallel);
     }
 
     #[test]
