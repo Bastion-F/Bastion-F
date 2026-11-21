@@ -1,4 +1,3 @@
-// Yes, I like Claude Code mascot, so I added it here. 
 use std::io::{self, Write};
 use std::time::Duration;
 
@@ -13,9 +12,9 @@ pub const RED: &str = "\x1b[38;5;167m";
 
 pub fn print_banner(cwd: &str) {
     println!();
-    println!("  {ACCENT}▐▛███▜▌{RESET}    {BOLD}{TEXT}knox{RESET} {MUTED}v0.5.1{RESET}");
-    println!("  {ACCENT}▜█████▛▘{RESET}   {MUTED}KNOX-256 · Argon2id · HKDF-SHA256 · HMAC{RESET}");
-    println!("   {ACCENT}▘▘ ▝▝{RESET}     {MUTED}16 rounds · 256-bit key · {cwd}{RESET}");
+    println!("  {ACCENT}▐▛███▜▌{RESET}    {BOLD}{TEXT}knox{RESET} {MUTED}v0.5.2{RESET}");
+    println!("  {ACCENT}▜█████▛▘{RESET}   {MUTED}KNOX-256 · Argon2id · BLAKE3 · STREAM{RESET}");
+    println!("   {ACCENT}▘▘ ▝▝{RESET}     {MUTED}64 KiB chunks · O(1) RAM · {cwd}{RESET}");
     println!();
     println!("  {BORDER}──────────────────────────────────────────────────────────{RESET}");
     println!(
@@ -35,13 +34,13 @@ pub fn print_op(verb: &str, subject: &str) {
 
 pub fn print_line(label: &str, value: &str, last: bool) {
     let glyph = if last { "└" } else { "├" };
-    println!("  {BORDER}{glyph}{RESET} {MUTED}{label:<9}{RESET} {TEXT}{value}{RESET}");
+    println!("  {BORDER}{glyph}{RESET} {MUTED}{label:<10}{RESET} {TEXT}{value}{RESET}");
 }
 
 pub fn print_done(label: &str, value: &str, elapsed: Duration) {
     let ms = elapsed.as_secs_f64() * 1000.0;
     println!(
-        "  {BORDER}└{RESET} {MUTED}{label:<9}{RESET} {GREEN}{value}{RESET}  {MUTED}[{ms:.1} ms]{RESET}"
+        "  {BORDER}└{RESET} {MUTED}{label:<10}{RESET} {GREEN}{value}{RESET}  {MUTED}[{ms:.1} ms]{RESET}"
     );
 }
 
@@ -51,18 +50,18 @@ pub fn print_err(msg: &str) {
 
 pub fn print_help() {
     println!("{MUTED}Commands:{RESET}");
-    println!("  {ACCENT}/enc{RESET}  {TEXT}<file> [out]{RESET}    {MUTED}Encrypt file to .knx container{RESET}");
-    println!("  {ACCENT}/dec{RESET}  {TEXT}<file> [out]{RESET}    {MUTED}Verify HMAC and decrypt .knx container{RESET}");
-    println!("  {ACCENT}/seal{RESET} {TEXT}<text>{RESET}          {MUTED}Encrypt text into knx2: armored token{RESET}");
-    println!("  {ACCENT}/open{RESET} {TEXT}<knx2:...>{RESET}      {MUTED}Decrypt knx2: armored token{RESET}");
-    println!("  {ACCENT}/info{RESET} {TEXT}<file>{RESET}          {MUTED}Inspect .knx header, salt, nonce & tag{RESET}");
-    println!("  {ACCENT}/bench{RESET}                {MUTED}Run KNOX-256 throughput & avalanche check{RESET}");
+    println!("  {ACCENT}/enc{RESET}  {TEXT}<file> [out]{RESET}    {MUTED}Stream-encrypt file to .knx container{RESET}");
+    println!("  {ACCENT}/dec{RESET}  {TEXT}<file> [out]{RESET}    {MUTED}Verify & stream-decrypt .knx container{RESET}");
+    println!("  {ACCENT}/seal{RESET} {TEXT}<text>{RESET}          {MUTED}Encrypt text into knx3: armored token{RESET}");
+    println!("  {ACCENT}/open{RESET} {TEXT}<knx3:...>{RESET}      {MUTED}Decrypt knx3: armored token{RESET}");
+    println!("  {ACCENT}/info{RESET} {TEXT}<file>{RESET}          {MUTED}Inspect .knx header without loading file{RESET}");
+    println!("  {ACCENT}/bench{RESET}                {MUTED}Run KNOX-256 + BLAKE3 STREAM benchmark{RESET}");
     println!("  {ACCENT}/clear{RESET}                {MUTED}Clear terminal{RESET}");
     println!("  {ACCENT}/quit{RESET}                 {MUTED}Exit session{RESET}");
 }
 
-pub fn format_bytes(n: usize) -> String {
-    let units = ["B", "KiB", "MiB", "GiB"];
+pub fn format_bytes(n: u64) -> String {
+    let units = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut size = n as f64;
     let mut idx = 0;
     while size >= 1024.0 && idx < units.len() - 1 {
