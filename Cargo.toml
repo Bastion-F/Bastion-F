@@ -1,16 +1,14 @@
 [package]
 name = "knox"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 
 [dependencies]
 argon2 = "0.5"
+blake3 = "1.5"
 getrandom = "0.2"
-hkdf = "0.12"
-hmac = "0.12"
 rayon = "1.10"
 rpassword = "7.3"
-sha2 = "0.10"
 subtle = "2.6"
 zeroize = { version = "1.8", features = ["derive"] }
 
