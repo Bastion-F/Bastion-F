@@ -5,10 +5,10 @@ use cipher::Knox256;
 use rayon::prelude::*;
 use std::io::{self, Cursor, Read, Write};
 use subtle::ConstantTimeEq;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 pub const MAGIC: &[u8; 4] = b"KNOX";
-pub const VERSION: u8 = 3;
+pub const VERSION: u8 = 4;
 pub const HEADER_LEN: usize = 120;
 pub const TAG_LEN: usize = 32;
 pub const CHUNK_SIZE: usize = 64 * 1024;
@@ -18,12 +18,51 @@ const BATCH_CHUNKS: usize = 64;
 const BATCH_PLAIN: usize = BATCH_CHUNKS * CHUNK_SIZE;
 const BATCH_ENC: usize = BATCH_CHUNKS * ENC_CHUNK_SIZE;
 
-const ARGON_MEM_KIB: u32 = 65536;
-const ARGON_ITERS: u32 = 3;
-const ARGON_LANES: u32 = 1;
+pub const DEFAULT_M_LOG2: u8 = 16;
+pub const DEFAULT_T_COST: u8 = 3;
+pub const DEFAULT_P_COST: u8 = 4;
+
+#[derive(Clone, Copy)]
+pub struct KdfParams {
+    pub m_log2: u8,
+    pub t_cost: u8,
+    pub p_cost: u8,
+}
+
+impl KdfParams {
+    pub fn default_v4() -> Self {
+        Self {
+            m_log2: DEFAULT_M_LOG2,
+            t_cost: DEFAULT_T_COST,
+            p_cost: DEFAULT_P_COST,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.m_log2 < 12 || self.m_log2 > 22 {
+            return Err("invalid argon2 memory parameter in header".to_string());
+        }
+        if self.t_cost < 1 || self.t_cost > 16 {
+            return Err("invalid argon2 time parameter in header".to_string());
+        }
+        if self.p_cost < 1 || self.p_cost > 16 {
+            return Err("invalid argon2 lanes parameter in header".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn mem_kib(&self) -> u32 {
+        1u32 << self.m_log2
+    }
+
+    pub fn mem_mib(&self) -> u32 {
+        self.mem_kib() / 1024
+    }
+}
 
 pub struct HeaderInfo {
     pub version: u8,
+    pub kdf: KdfParams,
     pub salt: [u8; 16],
     pub wrap_nonce: [u8; 16],
     pub wrapped_key: [u8; 32],
@@ -57,6 +96,16 @@ fn fill_rand(buf: &mut [u8]) -> Result<(), String> {
     getrandom::getrandom(buf).map_err(|_| "system rng failed".to_string())
 }
 
+pub fn random_hex(len: usize) -> Result<String, String> {
+    let mut buf = vec![0u8; len];
+    fill_rand(&mut buf)?;
+    let mut out = String::with_capacity(len * 2);
+    for b in buf {
+        out.push_str(&format!("{b:02x}"));
+    }
+    Ok(out)
+}
+
 fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<usize> {
     let mut total = 0;
     while total < buf.len() {
@@ -73,8 +122,10 @@ fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<usize> {
 fn derive_kek(
     pass: &[u8],
     salt: &[u8; 16],
+    kdf: KdfParams,
 ) -> Result<(Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>), String> {
-    let params = Params::new(ARGON_MEM_KIB, ARGON_ITERS, ARGON_LANES, Some(32))
+    kdf.validate()?;
+    let params = Params::new(kdf.mem_kib(), kdf.t_cost as u32, kdf.p_cost as u32, Some(32))
         .map_err(|_| "invalid argon2 params".to_string())?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
@@ -87,8 +138,8 @@ fn derive_kek(
     km[0..32].copy_from_slice(&*master);
     km[32..48].copy_from_slice(salt);
 
-    let wrap_key = Zeroizing::new(blake3::derive_key("knox v3 header wrap key", &*km));
-    let hdr_mac_key = Zeroizing::new(blake3::derive_key("knox v3 header mac key", &*km));
+    let wrap_key = Zeroizing::new(blake3::derive_key("knox v4 header wrap key", &*km));
+    let hdr_mac_key = Zeroizing::new(blake3::derive_key("knox v4 header mac key", &*km));
     Ok((wrap_key, hdr_mac_key))
 }
 
@@ -100,8 +151,8 @@ fn derive_payload_keys(
     km[0..32].copy_from_slice(file_key);
     km[32..48].copy_from_slice(stream_nonce);
 
-    let enc_key = Zeroizing::new(blake3::derive_key("knox v3 payload enc key", &*km));
-    let mac_key = Zeroizing::new(blake3::derive_key("knox v3 payload mac key", &*km));
+    let enc_key = Zeroizing::new(blake3::derive_key("knox v4 payload enc key", &*km));
+    let mac_key = Zeroizing::new(blake3::derive_key("knox v4 payload mac key", &*km));
     (enc_key, mac_key)
 }
 
@@ -221,6 +272,7 @@ fn decrypt_chunk(
 }
 
 pub fn prepare_seal(pass: &str) -> Result<PreparedSeal, String> {
+    let kdf = KdfParams::default_v4();
     let mut salt = [0u8; 16];
     let mut wrap_nonce = [0u8; 16];
     let mut stream_nonce = [0u8; 16];
@@ -231,7 +283,7 @@ pub fn prepare_seal(pass: &str) -> Result<PreparedSeal, String> {
     fill_rand(&mut stream_nonce)?;
     fill_rand(&mut *file_key)?;
 
-    let (wrap_key, hdr_mac_key) = derive_kek(pass.as_bytes(), &salt)?;
+    let (wrap_key, hdr_mac_key) = derive_kek(pass.as_bytes(), &salt, kdf)?;
     let wrap_cipher = Knox256::new(&wrap_key);
 
     let mut wrapped_key = *file_key;
@@ -240,6 +292,9 @@ pub fn prepare_seal(pass: &str) -> Result<PreparedSeal, String> {
     let mut header = [0u8; HEADER_LEN];
     header[0..4].copy_from_slice(MAGIC);
     header[4] = VERSION;
+    header[5] = kdf.m_log2;
+    header[6] = kdf.t_cost;
+    header[7] = kdf.p_cost;
     header[8..24].copy_from_slice(&salt);
     header[24..40].copy_from_slice(&wrap_nonce);
     header[40..72].copy_from_slice(&wrapped_key);
@@ -272,6 +327,7 @@ pub fn seal_payload<R: Read, W: Write, F: FnMut(u64)>(
     let cipher = Knox256::new(&prepared.enc_key);
 
     let mut buf = Zeroizing::new(vec![0u8; BATCH_PLAIN + 1]);
+    let mut out_batch = Vec::with_capacity(BATCH_ENC);
     let mut pending: Option<u8> = None;
     let mut chunk_idx = 0u64;
     let mut bytes_in = 0u64;
@@ -318,6 +374,7 @@ pub fn seal_payload<R: Read, W: Write, F: FnMut(u64)>(
         let count = (batch_len + CHUNK_SIZE - 1) / CHUNK_SIZE;
         let base_idx = chunk_idx;
 
+        out_batch.clear();
         if count == 1 {
             let enc = encrypt_chunk(
                 &cipher,
@@ -327,10 +384,7 @@ pub fn seal_payload<R: Read, W: Write, F: FnMut(u64)>(
                 is_eof,
                 slice,
             );
-            writer
-                .write_all(&enc)
-                .map_err(|e| format!("write error: {e}"))?;
-            bytes_out += enc.len() as u64;
+            out_batch.extend_from_slice(&enc);
         } else {
             let encrypted: Vec<Vec<u8>> = (0..count)
                 .into_par_iter()
@@ -350,13 +404,14 @@ pub fn seal_payload<R: Read, W: Write, F: FnMut(u64)>(
                 .collect();
 
             for c in &encrypted {
-                writer
-                    .write_all(c)
-                    .map_err(|e| format!("write error: {e}"))?;
-                bytes_out += c.len() as u64;
+                out_batch.extend_from_slice(c);
             }
         }
 
+        writer
+            .write_all(&out_batch)
+            .map_err(|e| format!("write error: {e}"))?;
+        bytes_out += out_batch.len() as u64;
         bytes_in += batch_len as u64;
         chunk_idx += count as u64;
         on_progress(bytes_in);
@@ -383,6 +438,13 @@ pub fn parse_header(raw: &[u8]) -> Result<HeaderInfo, String> {
         return Err(format!("unsupported container version: v{version}"));
     }
 
+    let kdf = KdfParams {
+        m_log2: raw[5],
+        t_cost: raw[6],
+        p_cost: raw[7],
+    };
+    kdf.validate()?;
+
     let mut salt = [0u8; 16];
     let mut wrap_nonce = [0u8; 16];
     let mut wrapped_key = [0u8; 32];
@@ -397,6 +459,7 @@ pub fn parse_header(raw: &[u8]) -> Result<HeaderInfo, String> {
 
     Ok(HeaderInfo {
         version,
+        kdf,
         salt,
         wrap_nonce,
         wrapped_key,
@@ -422,7 +485,7 @@ pub fn unlock_header<R: Read>(reader: &mut R, pass: &str) -> Result<UnlockedStre
     }
 
     let info = parse_header(&raw)?;
-    let (wrap_key, hdr_mac_key) = derive_kek(pass.as_bytes(), &info.salt)?;
+    let (wrap_key, hdr_mac_key) = derive_kek(pass.as_bytes(), &info.salt, info.kdf)?;
 
     let expected_mac = *blake3::keyed_hash(&hdr_mac_key, &raw[0..88]).as_bytes();
     if !bool::from(expected_mac.ct_eq(&info.header_mac)) {
@@ -451,6 +514,7 @@ pub fn open_payload<R: Read, W: Write, F: FnMut(u64)>(
     let cipher = Knox256::new(&unlocked.enc_key);
 
     let mut buf = vec![0u8; BATCH_ENC + 1];
+    let mut plain_batch = Zeroizing::new(Vec::with_capacity(BATCH_PLAIN));
     let mut pending: Option<u8> = None;
     let mut chunk_idx = 0u64;
     let mut bytes_in = HEADER_LEN as u64;
@@ -482,6 +546,7 @@ pub fn open_payload<R: Read, W: Write, F: FnMut(u64)>(
         let count = (batch_len + ENC_CHUNK_SIZE - 1) / ENC_CHUNK_SIZE;
         let base_idx = chunk_idx;
 
+        plain_batch.zeroize();
         if count == 1 {
             let plain = decrypt_chunk(
                 &cipher,
@@ -491,10 +556,7 @@ pub fn open_payload<R: Read, W: Write, F: FnMut(u64)>(
                 is_eof,
                 slice,
             )?;
-            writer
-                .write_all(&plain)
-                .map_err(|e| format!("write error: {e}"))?;
-            bytes_out += plain.len() as u64;
+            plain_batch.extend_from_slice(&plain);
         } else {
             let results: Vec<Result<Zeroizing<Vec<u8>>, String>> = (0..count)
                 .into_par_iter()
@@ -515,12 +577,15 @@ pub fn open_payload<R: Read, W: Write, F: FnMut(u64)>(
 
             for res in results {
                 let plain = res?;
-                writer
-                    .write_all(&plain)
-                    .map_err(|e| format!("write error: {e}"))?;
-                bytes_out += plain.len() as u64;
+                plain_batch.extend_from_slice(&plain);
             }
         }
+
+        writer
+            .write_all(&plain_batch)
+            .map_err(|e| format!("write error: {e}"))?;
+        bytes_out += plain_batch.len() as u64;
+        plain_batch.zeroize();
 
         bytes_in += batch_len as u64;
         chunk_idx += count as u64;
@@ -624,20 +689,21 @@ pub fn b64_encode(input: &[u8]) -> String {
 }
 
 pub fn b64_decode(input: &str) -> Result<Vec<u8>, String> {
+    if input.len() % 4 == 1 {
+        return Err("malformed armored token".to_string());
+    }
+
     let mut out = Vec::with_capacity((input.len() * 3) / 4);
     let mut buf = 0u32;
     let mut bits = 0u32;
 
     for b in input.bytes() {
-        if b == b'=' || b.is_ascii_whitespace() {
-            continue;
-        }
         let val = match b {
             b'A'..=b'Z' => b - b'A',
             b'a'..=b'z' => b - b'a' + 26,
             b'0'..=b'9' => b - b'0' + 52,
-            b'-' | b'+' => 62,
-            b'_' | b'/' => 63,
+            b'-' => 62,
+            b'_' => 63,
             _ => return Err("malformed armored token".to_string()),
         };
         buf = (buf << 6) | (val as u32);
@@ -647,6 +713,11 @@ pub fn b64_decode(input: &str) -> Result<Vec<u8>, String> {
             out.push(((buf >> bits) & 0xFF) as u8);
         }
     }
+
+    if bits > 0 && (buf & ((1u32 << bits) - 1)) != 0 {
+        return Err("non-canonical armored token".to_string());
+    }
+
     Ok(out)
 }
 
@@ -660,7 +731,7 @@ mod tests {
         let (opened_empty, _) = open_bytes(&sealed_empty, "pass").unwrap();
         assert!(opened_empty.is_empty());
 
-        let msg = b"blake3 + age stream";
+        let msg = b"aes-ni + blake3 + age stream";
         let (sealed, _) = seal_bytes(msg, "pass").unwrap();
         let (opened, _) = open_bytes(&sealed, "pass").unwrap();
         assert_eq!(&*opened, msg);
@@ -692,10 +763,17 @@ mod tests {
     }
 
     #[test]
-    fn test_exact_chunk_boundary() {
-        let data = vec![0x5Au8; CHUNK_SIZE];
-        let (sealed, _) = seal_bytes(&data, "edge").unwrap();
-        let (opened, _) = open_bytes(&sealed, "edge").unwrap();
-        assert_eq!(&*opened, &data);
+    fn test_canonical_base64() {
+        for len in 0..32 {
+            let mut data = Vec::new();
+            for i in 0..len {
+                data.push((i * 37) as u8);
+            }
+            let enc = b64_encode(&data);
+            assert_eq!(b64_decode(&enc).unwrap(), data);
+        }
+        assert!(b64_decode("AB").is_err());
+        assert!(b64_decode("A").is_err());
+        assert!(b64_decode("AA+A").is_err());
     }
 }
