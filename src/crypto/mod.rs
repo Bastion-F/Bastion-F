@@ -178,43 +178,6 @@ fn wrap_xor(cipher: &Knox256, wrap_nonce: &[u8; 16], data: &mut [u8; 32]) {
     }
 }
 
-fn ctr_chunk(
-    cipher: &Knox256,
-    stream_nonce: &[u8; 16],
-    chunk_idx: u64,
-    is_last: bool,
-    data: &mut [u8],
-) {
-    let mut base_lo_bytes = [0u8; 8];
-    base_lo_bytes.copy_from_slice(&stream_nonce[0..8]);
-    let base_lo = u64::from_le_bytes(base_lo_bytes);
-
-    let mut base_mid_bytes = [0u8; 4];
-    base_mid_bytes.copy_from_slice(&stream_nonce[8..12]);
-    let base_mid = u32::from_le_bytes(base_mid_bytes);
-
-    let last_mask = if is_last { 0xFFu8 } else { 0x00u8 };
-
-    for (b, block) in data.chunks_mut(16).enumerate() {
-        let b_u32 = b as u32;
-        let mut ctr = [0u8; 16];
-        ctr[0..8].copy_from_slice(&chunk_idx.to_le_bytes());
-        ctr[8..12].copy_from_slice(&b_u32.to_le_bytes());
-        ctr[12..15].copy_from_slice(&stream_nonce[12..15]);
-        ctr[15] = stream_nonce[15] ^ last_mask;
-
-        let mut tweak = *stream_nonce;
-        tweak[0..8].copy_from_slice(&(base_lo ^ chunk_idx).to_le_bytes());
-        tweak[8..12].copy_from_slice(&(base_mid ^ b_u32).to_le_bytes());
-        tweak[15] ^= last_mask;
-
-        let ks = cipher.encrypt_block(ctr, tweak);
-        for j in 0..block.len() {
-            block[j] ^= ks[j];
-        }
-    }
-}
-
 fn chunk_mac(
     mac_key: &[u8; 32],
     stream_nonce: &[u8; 16],
@@ -230,30 +193,31 @@ fn chunk_mac(
     *h.finalize().as_bytes()
 }
 
-fn encrypt_chunk(
+fn encrypt_chunk_into(
     cipher: &Knox256,
     mac_key: &[u8; 32],
     stream_nonce: &[u8; 16],
     chunk_idx: u64,
     is_last: bool,
     plain: &[u8],
-) -> Vec<u8> {
-    let mut out = Vec::with_capacity(plain.len() + TAG_LEN);
-    out.extend_from_slice(plain);
-    ctr_chunk(cipher, stream_nonce, chunk_idx, is_last, &mut out);
-    let tag = chunk_mac(mac_key, stream_nonce, chunk_idx, is_last, &out);
-    out.extend_from_slice(&tag);
-    out
+    dst: &mut [u8],
+) {
+    let len = plain.len();
+    dst[..len].copy_from_slice(plain);
+    cipher.ctr_chunk(stream_nonce, chunk_idx, is_last, &mut dst[..len]);
+    let tag = chunk_mac(mac_key, stream_nonce, chunk_idx, is_last, &dst[..len]);
+    dst[len..len + TAG_LEN].copy_from_slice(&tag);
 }
 
-fn decrypt_chunk(
+fn decrypt_chunk_into(
     cipher: &Knox256,
     mac_key: &[u8; 32],
     stream_nonce: &[u8; 16],
     chunk_idx: u64,
     is_last: bool,
     enc: &[u8],
-) -> Result<Zeroizing<Vec<u8>>, String> {
+    dst: &mut [u8],
+) -> Result<(), String> {
     if enc.len() < TAG_LEN {
         return Err("corrupted or truncated chunk".to_string());
     }
@@ -266,9 +230,9 @@ fn decrypt_chunk(
         return Err(format!("chunk {chunk_idx} auth failed: tampered or truncated data"));
     }
 
-    let mut plain = Zeroizing::new(ct.to_vec());
-    ctr_chunk(cipher, stream_nonce, chunk_idx, is_last, &mut plain);
-    Ok(plain)
+    dst[..split].copy_from_slice(ct);
+    cipher.ctr_chunk(stream_nonce, chunk_idx, is_last, &mut dst[..split]);
+    Ok(())
 }
 
 pub fn prepare_seal(pass: &str) -> Result<PreparedSeal, String> {
@@ -327,7 +291,7 @@ pub fn seal_payload<R: Read, W: Write, F: FnMut(u64)>(
     let cipher = Knox256::new(&prepared.enc_key);
 
     let mut buf = Zeroizing::new(vec![0u8; BATCH_PLAIN + 1]);
-    let mut out_batch = Vec::with_capacity(BATCH_ENC);
+    let mut out_batch = vec![0u8; BATCH_ENC];
     let mut pending: Option<u8> = None;
     let mut chunk_idx = 0u64;
     let mut bytes_in = 0u64;
@@ -345,18 +309,20 @@ pub fn seal_payload<R: Read, W: Write, F: FnMut(u64)>(
 
         if total == 0 {
             if chunk_idx == 0 {
-                let enc = encrypt_chunk(
+                let mut empty_tag = [0u8; TAG_LEN];
+                encrypt_chunk_into(
                     &cipher,
                     &prepared.mac_key,
                     &prepared.stream_nonce,
                     0,
                     true,
                     &[],
+                    &mut empty_tag,
                 );
                 writer
-                    .write_all(&enc)
+                    .write_all(&empty_tag)
                     .map_err(|e| format!("write error: {e}"))?;
-                bytes_out += enc.len() as u64;
+                bytes_out += TAG_LEN as u64;
                 chunk_idx = 1;
             }
             break;
@@ -373,45 +339,43 @@ pub fn seal_payload<R: Read, W: Write, F: FnMut(u64)>(
         let slice = &buf[..batch_len];
         let count = (batch_len + CHUNK_SIZE - 1) / CHUNK_SIZE;
         let base_idx = chunk_idx;
+        let enc_len = batch_len + count * TAG_LEN;
+        let out_slice = &mut out_batch[..enc_len];
 
-        out_batch.clear();
         if count == 1 {
-            let enc = encrypt_chunk(
+            encrypt_chunk_into(
                 &cipher,
                 &prepared.mac_key,
                 &prepared.stream_nonce,
                 base_idx,
                 is_eof,
                 slice,
+                out_slice,
             );
-            out_batch.extend_from_slice(&enc);
         } else {
-            let encrypted: Vec<Vec<u8>> = (0..count)
-                .into_par_iter()
-                .map(|i| {
+            out_slice
+                .par_chunks_mut(ENC_CHUNK_SIZE)
+                .enumerate()
+                .for_each(|(i, dst)| {
                     let start = i * CHUNK_SIZE;
                     let end = (start + CHUNK_SIZE).min(batch_len);
                     let last = is_eof && (i + 1 == count);
-                    encrypt_chunk(
+                    encrypt_chunk_into(
                         &cipher,
                         &prepared.mac_key,
                         &prepared.stream_nonce,
                         base_idx + (i as u64),
                         last,
                         &slice[start..end],
-                    )
-                })
-                .collect();
-
-            for c in &encrypted {
-                out_batch.extend_from_slice(c);
-            }
+                        dst,
+                    );
+                });
         }
 
         writer
-            .write_all(&out_batch)
+            .write_all(out_slice)
             .map_err(|e| format!("write error: {e}"))?;
-        bytes_out += out_batch.len() as u64;
+        bytes_out += enc_len as u64;
         bytes_in += batch_len as u64;
         chunk_idx += count as u64;
         on_progress(bytes_in);
@@ -514,7 +478,7 @@ pub fn open_payload<R: Read, W: Write, F: FnMut(u64)>(
     let cipher = Knox256::new(&unlocked.enc_key);
 
     let mut buf = vec![0u8; BATCH_ENC + 1];
-    let mut plain_batch = Zeroizing::new(Vec::with_capacity(BATCH_PLAIN));
+    let mut plain_batch = Zeroizing::new(vec![0u8; BATCH_PLAIN]);
     let mut pending: Option<u8> = None;
     let mut chunk_idx = 0u64;
     let mut bytes_in = HEADER_LEN as u64;
@@ -545,47 +509,57 @@ pub fn open_payload<R: Read, W: Write, F: FnMut(u64)>(
         let slice = &buf[..batch_len];
         let count = (batch_len + ENC_CHUNK_SIZE - 1) / ENC_CHUNK_SIZE;
         let base_idx = chunk_idx;
+        let last_chunk_len = batch_len - (count - 1) * ENC_CHUNK_SIZE;
 
-        plain_batch.zeroize();
-        if count == 1 {
-            let plain = decrypt_chunk(
+        if last_chunk_len < TAG_LEN || (count > 1 && last_chunk_len == TAG_LEN) {
+            return Err("corrupted or truncated chunk".to_string());
+        }
+
+        let plain_len = batch_len - count * TAG_LEN;
+        let out_slice = &mut plain_batch[..plain_len];
+
+        let res = if count == 1 {
+            decrypt_chunk_into(
                 &cipher,
                 &unlocked.mac_key,
                 &unlocked.stream_nonce,
                 base_idx,
                 is_eof,
                 slice,
-            )?;
-            plain_batch.extend_from_slice(&plain);
+                out_slice,
+            )
         } else {
-            let results: Vec<Result<Zeroizing<Vec<u8>>, String>> = (0..count)
-                .into_par_iter()
-                .map(|i| {
+            out_slice
+                .par_chunks_mut(CHUNK_SIZE)
+                .enumerate()
+                .try_for_each(|(i, dst)| {
                     let start = i * ENC_CHUNK_SIZE;
                     let end = (start + ENC_CHUNK_SIZE).min(batch_len);
                     let last = is_eof && (i + 1 == count);
-                    decrypt_chunk(
+                    decrypt_chunk_into(
                         &cipher,
                         &unlocked.mac_key,
                         &unlocked.stream_nonce,
                         base_idx + (i as u64),
                         last,
                         &slice[start..end],
+                        dst,
                     )
                 })
-                .collect();
+        };
 
-            for res in results {
-                let plain = res?;
-                plain_batch.extend_from_slice(&plain);
-            }
+        if let Err(e) = res {
+            out_slice.zeroize();
+            return Err(e);
         }
 
-        writer
-            .write_all(&plain_batch)
-            .map_err(|e| format!("write error: {e}"))?;
-        bytes_out += plain_batch.len() as u64;
-        plain_batch.zeroize();
+        if plain_len > 0 {
+            writer
+                .write_all(out_slice)
+                .map_err(|e| format!("write error: {e}"))?;
+            bytes_out += plain_len as u64;
+            out_slice.zeroize();
+        }
 
         bytes_in += batch_len as u64;
         chunk_idx += count as u64;
@@ -620,32 +594,33 @@ pub fn open_bytes(blob: &[u8], pass: &str) -> Result<(Zeroizing<Vec<u8>>, [u8; T
     Ok((plain, stats.header_mac))
 }
 
-pub fn bench_stream_pipeline(data: &[u8]) -> [u8; TAG_LEN] {
+pub fn bench_stream_pipeline(data: &[u8], out: &mut [u8]) -> [u8; TAG_LEN] {
     let cipher = Knox256::new(&[0x4Bu8; 32]);
     let mac_key = [0x7Fu8; 32];
     let nonce = [0x22u8; 16];
     let count = (data.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    let enc_len = data.len() + count * TAG_LEN;
 
-    let tags: Vec<[u8; TAG_LEN]> = (0..count)
-        .into_par_iter()
-        .map(|i| {
+    out[..enc_len]
+        .par_chunks_mut(ENC_CHUNK_SIZE)
+        .enumerate()
+        .for_each(|(i, dst)| {
             let start = i * CHUNK_SIZE;
             let end = (start + CHUNK_SIZE).min(data.len());
-            let enc = encrypt_chunk(
+            encrypt_chunk_into(
                 &cipher,
                 &mac_key,
                 &nonce,
                 i as u64,
                 i + 1 == count,
                 &data[start..end],
+                dst,
             );
-            let mut t = [0u8; TAG_LEN];
-            t.copy_from_slice(&enc[enc.len() - TAG_LEN..]);
-            t
-        })
-        .collect();
+        });
 
-    *tags.last().unwrap_or(&[0u8; TAG_LEN])
+    let mut tag = [0u8; TAG_LEN];
+    tag.copy_from_slice(&out[enc_len - TAG_LEN..enc_len]);
+    tag
 }
 
 pub fn hex_short(bytes: &[u8]) -> String {
