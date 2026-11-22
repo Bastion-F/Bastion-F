@@ -196,7 +196,7 @@ fn format_rate(bytes: u64, elapsed: Duration) -> String {
 
 pub fn print_banner(cwd: &str, backend: &str) {
     println!();
-    println!("  {ACCENT}▐▛███▜▌{RESET}    {BOLD}{TEXT}knox{RESET} {MUTED}v0.6.0{RESET}");
+    println!("  {ACCENT}▐▛███▜▌{RESET}    {BOLD}{TEXT}knox{RESET} {MUTED}v0.6.1-HOT{RESET}");
     println!("  {ACCENT}▜█████▛▘{RESET}   {MUTED}KNOX-256 [{backend}] · Argon2id · BLAKE3 · STREAM{RESET}");
     println!("   {ACCENT}▘▘ ▝▝{RESET}     {MUTED}constant-time · 0600 atomic I/O · {cwd}{RESET}");
     println!();
