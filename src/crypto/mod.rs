@@ -38,6 +38,14 @@ pub struct StreamStats {
     pub header_mac: [u8; TAG_LEN],
 }
 
+pub struct PreparedSeal {
+    pub header: [u8; HEADER_LEN],
+    pub enc_key: Zeroizing<[u8; 32]>,
+    pub mac_key: Zeroizing<[u8; 32]>,
+    pub stream_nonce: [u8; 16],
+    pub header_mac: [u8; TAG_LEN],
+}
+
 pub struct UnlockedStream {
     pub enc_key: Zeroizing<[u8; 32]>,
     pub mac_key: Zeroizing<[u8; 32]>,
@@ -212,11 +220,7 @@ fn decrypt_chunk(
     Ok(plain)
 }
 
-pub fn seal_stream<R: Read, W: Write>(
-    reader: &mut R,
-    writer: &mut W,
-    pass: &str,
-) -> Result<StreamStats, String> {
+pub fn prepare_seal(pass: &str) -> Result<PreparedSeal, String> {
     let mut salt = [0u8; 16];
     let mut wrap_nonce = [0u8; 16];
     let mut stream_nonce = [0u8; 16];
@@ -241,15 +245,31 @@ pub fn seal_stream<R: Read, W: Write>(
     header[40..72].copy_from_slice(&wrapped_key);
     header[72..88].copy_from_slice(&stream_nonce);
 
-    let hdr_mac = *blake3::keyed_hash(&hdr_mac_key, &header[0..88]).as_bytes();
-    header[88..120].copy_from_slice(&hdr_mac);
-
-    writer
-        .write_all(&header)
-        .map_err(|e| format!("write error: {e}"))?;
+    let header_mac = *blake3::keyed_hash(&hdr_mac_key, &header[0..88]).as_bytes();
+    header[88..120].copy_from_slice(&header_mac);
 
     let (enc_key, mac_key) = derive_payload_keys(&file_key, &stream_nonce);
-    let cipher = Knox256::new(&enc_key);
+
+    Ok(PreparedSeal {
+        header,
+        enc_key,
+        mac_key,
+        stream_nonce,
+        header_mac,
+    })
+}
+
+pub fn seal_payload<R: Read, W: Write, F: FnMut(u64)>(
+    reader: &mut R,
+    writer: &mut W,
+    prepared: &PreparedSeal,
+    mut on_progress: F,
+) -> Result<StreamStats, String> {
+    writer
+        .write_all(&prepared.header)
+        .map_err(|e| format!("write error: {e}"))?;
+
+    let cipher = Knox256::new(&prepared.enc_key);
 
     let mut buf = Zeroizing::new(vec![0u8; BATCH_PLAIN + 1]);
     let mut pending: Option<u8> = None;
@@ -269,7 +289,14 @@ pub fn seal_stream<R: Read, W: Write>(
 
         if total == 0 {
             if chunk_idx == 0 {
-                let enc = encrypt_chunk(&cipher, &mac_key, &stream_nonce, 0, true, &[]);
+                let enc = encrypt_chunk(
+                    &cipher,
+                    &prepared.mac_key,
+                    &prepared.stream_nonce,
+                    0,
+                    true,
+                    &[],
+                );
                 writer
                     .write_all(&enc)
                     .map_err(|e| format!("write error: {e}"))?;
@@ -292,7 +319,14 @@ pub fn seal_stream<R: Read, W: Write>(
         let base_idx = chunk_idx;
 
         if count == 1 {
-            let enc = encrypt_chunk(&cipher, &mac_key, &stream_nonce, base_idx, is_eof, slice);
+            let enc = encrypt_chunk(
+                &cipher,
+                &prepared.mac_key,
+                &prepared.stream_nonce,
+                base_idx,
+                is_eof,
+                slice,
+            );
             writer
                 .write_all(&enc)
                 .map_err(|e| format!("write error: {e}"))?;
@@ -306,8 +340,8 @@ pub fn seal_stream<R: Read, W: Write>(
                     let last = is_eof && (i + 1 == count);
                     encrypt_chunk(
                         &cipher,
-                        &mac_key,
-                        &stream_nonce,
+                        &prepared.mac_key,
+                        &prepared.stream_nonce,
                         base_idx + (i as u64),
                         last,
                         &slice[start..end],
@@ -325,6 +359,7 @@ pub fn seal_stream<R: Read, W: Write>(
 
         bytes_in += batch_len as u64;
         chunk_idx += count as u64;
+        on_progress(bytes_in);
 
         if is_eof {
             break;
@@ -335,7 +370,7 @@ pub fn seal_stream<R: Read, W: Write>(
         bytes_in,
         bytes_out,
         chunks: chunk_idx,
-        header_mac: hdr_mac,
+        header_mac: prepared.header_mac,
     })
 }
 
@@ -407,10 +442,11 @@ pub fn unlock_header<R: Read>(reader: &mut R, pass: &str) -> Result<UnlockedStre
     })
 }
 
-pub fn open_payload<R: Read, W: Write>(
+pub fn open_payload<R: Read, W: Write, F: FnMut(u64)>(
     reader: &mut R,
     writer: &mut W,
     unlocked: &UnlockedStream,
+    mut on_progress: F,
 ) -> Result<StreamStats, String> {
     let cipher = Knox256::new(&unlocked.enc_key);
 
@@ -488,6 +524,7 @@ pub fn open_payload<R: Read, W: Write>(
 
         bytes_in += batch_len as u64;
         chunk_idx += count as u64;
+        on_progress(bytes_in - (HEADER_LEN as u64));
 
         if is_eof {
             break;
@@ -503,9 +540,10 @@ pub fn open_payload<R: Read, W: Write>(
 }
 
 pub fn seal_bytes(plain: &[u8], pass: &str) -> Result<(Vec<u8>, [u8; TAG_LEN]), String> {
+    let prepared = prepare_seal(pass)?;
     let mut reader = Cursor::new(plain);
     let mut out = Vec::with_capacity(HEADER_LEN + plain.len() + TAG_LEN);
-    let stats = seal_stream(&mut reader, &mut out, pass)?;
+    let stats = seal_payload(&mut reader, &mut out, &prepared, |_| {})?;
     Ok((out, stats.header_mac))
 }
 
@@ -513,7 +551,7 @@ pub fn open_bytes(blob: &[u8], pass: &str) -> Result<(Zeroizing<Vec<u8>>, [u8; T
     let mut reader = Cursor::new(blob);
     let unlocked = unlock_header(&mut reader, pass)?;
     let mut plain = Zeroizing::new(Vec::new());
-    let stats = open_payload(&mut reader, &mut *plain, &unlocked)?;
+    let stats = open_payload(&mut reader, &mut *plain, &unlocked, |_| {})?;
     Ok((plain, stats.header_mac))
 }
 
@@ -528,7 +566,14 @@ pub fn bench_stream_pipeline(data: &[u8]) -> [u8; TAG_LEN] {
         .map(|i| {
             let start = i * CHUNK_SIZE;
             let end = (start + CHUNK_SIZE).min(data.len());
-            let enc = encrypt_chunk(&cipher, &mac_key, &nonce, i as u64, i + 1 == count, &data[start..end]);
+            let enc = encrypt_chunk(
+                &cipher,
+                &mac_key,
+                &nonce,
+                i as u64,
+                i + 1 == count,
+                &data[start..end],
+            );
             let mut t = [0u8; TAG_LEN];
             t.copy_from_slice(&enc[enc.len() - TAG_LEN..]);
             t
