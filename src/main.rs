@@ -411,17 +411,18 @@ fn run_bench() {
     let cipher = Knox256::new(&[0x4Bu8; 32]);
     let tweak = [0x7Fu8; 16];
 
-    let mut block = [0x11u8; 16];
     let start = Instant::now();
-    for _ in 0..blocks {
-        block = cipher.encrypt_block(block, tweak);
-    }
+    let block = cipher.encrypt_chain([0x11u8; 16], tweak, blocks);
     let single_elapsed = start.elapsed();
     let single_mib = ((blocks * 16) as f64 / (1024.0 * 1024.0)) / single_elapsed.as_secs_f64();
 
-    let buf = vec![0x42u8; 64 * 1024 * 1024];
+    let size = 64 * 1024 * 1024;
+    let chunks = size / crypto::CHUNK_SIZE;
+    let buf = vec![0x42u8; size];
+    let mut out = vec![0u8; size + chunks * crypto::TAG_LEN];
+
     let stream_start = Instant::now();
-    let last_tag = crypto::bench_stream_pipeline(&buf);
+    let last_tag = crypto::bench_stream_pipeline(&buf, &mut out);
     let stream_elapsed = stream_start.elapsed();
     let stream_mib = 64.0 / stream_elapsed.as_secs_f64();
     let threads = rayon::current_num_threads();
