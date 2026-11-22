@@ -1,13 +1,15 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 mod crypto;
 mod ui;
 
 use crypto::cipher::Knox256;
 use std::env;
-use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
-use std::path::Path;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufRead, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use zeroize::Zeroizing;
 
@@ -31,7 +33,7 @@ fn main() {
             Ok(())
         }
         "-h" | "--help" | "help" => {
-            ui::print_banner(&get_cwd());
+            ui::print_banner(&get_cwd(), active_backend());
             ui::print_help();
             Ok(())
         }
@@ -44,13 +46,18 @@ fn main() {
     }
 }
 
+fn active_backend() -> &'static str {
+    let probe = Knox256::new(&[0u8; 32]);
+    probe.backend_name()
+}
+
 fn run_repl() {
-    ui::print_banner(&get_cwd());
+    ui::print_banner(&get_cwd(), active_backend());
     let stdin = io::stdin();
 
     loop {
         ui::print_prompt();
-        let mut line = String::new();
+        let mut line = Zeroizing::new(String::new());
         match stdin.lock().read_line(&mut line) {
             Ok(0) => {
                 println!();
@@ -78,7 +85,7 @@ fn run_repl() {
             "/clear" => {
                 print!("\x1b[2J\x1b[H");
                 let _ = io::stdout().flush();
-                ui::print_banner(&get_cwd());
+                ui::print_banner(&get_cwd(), active_backend());
                 Ok(())
             }
             "/help" | "help" => {
@@ -145,6 +152,27 @@ fn same_path(a: &str, b: &str) -> bool {
     }
 }
 
+fn create_temp_file(target: &str) -> Result<(File, PathBuf), String> {
+    let parent = match Path::new(target).parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let suffix = crypto::random_hex(8)?;
+    let tmp_path = parent.join(format!(".knox-tmp-{suffix}"));
+
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        opts.mode(0o600);
+    }
+
+    let file = opts
+        .open(&tmp_path)
+        .map_err(|e| format!("cannot create temp file '{}': {e}", tmp_path.display()))?;
+    Ok((file, tmp_path))
+}
+
 fn run_enc(args: &[String]) -> Result<(), String> {
     if args.is_empty() {
         return Err("usage: enc <file> [out]".to_string());
@@ -160,7 +188,8 @@ fn run_enc(args: &[String]) -> Result<(), String> {
         return Err("input and output paths must be different".to_string());
     }
 
-    let in_file = File::open(input_path).map_err(|e| format!("cannot open '{input_path}': {e}"))?;
+    let mut in_file =
+        File::open(input_path).map_err(|e| format!("cannot open '{input_path}': {e}"))?;
     let total_size = in_file.metadata().map(|m| m.len()).unwrap_or(0);
     let pass = ask_pass(true)?;
 
@@ -169,31 +198,41 @@ fn run_enc(args: &[String]) -> Result<(), String> {
     let prepared = crypto::prepare_seal(&pass)?;
     spin.finish();
 
-    let out_file =
-        File::create(&output_path).map_err(|e| format!("cannot create '{output_path}': {e}"))?;
-
-    let mut reader = BufReader::with_capacity(256 * 1024, in_file);
-    let mut writer = BufWriter::with_capacity(256 * 1024, out_file);
+    let (mut tmp_file, tmp_path) = create_temp_file(&output_path)?;
     let mut bar = ui::Progress::new("enc", total_size);
 
-    let res = crypto::seal_payload(&mut reader, &mut writer, &prepared, |done| bar.update(done));
+    let res = crypto::seal_payload(&mut in_file, &mut tmp_file, &prepared, |done| {
+        bar.update(done)
+    });
     bar.finish();
 
     let stats = match res {
         Ok(s) => s,
         Err(e) => {
-            drop(writer);
-            let _ = fs::remove_file(&output_path);
+            drop(tmp_file);
+            let _ = fs::remove_file(&tmp_path);
             return Err(e);
         }
     };
 
-    writer
-        .flush()
-        .map_err(|e| format!("cannot flush '{output_path}': {e}"))?;
+    if let Err(e) = tmp_file.sync_all() {
+        drop(tmp_file);
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!("cannot sync output: {e}"));
+    }
+    drop(tmp_file);
+
+    if let Err(e) = fs::rename(&tmp_path, &output_path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!("cannot finalize '{output_path}': {e}"));
+    }
 
     ui::print_op("enc", &format!("{input_path} → {output_path}"));
-    ui::print_line("cipher", "KNOX-256 + Argon2id + BLAKE3 STREAM", false);
+    ui::print_line(
+        "cipher",
+        &format!("KNOX-256 [{}] + Argon2id + BLAKE3", active_backend()),
+        false,
+    );
     ui::print_line(
         "size",
         &format!(
@@ -229,39 +268,47 @@ fn run_dec(args: &[String]) -> Result<(), String> {
         return Err("input and output paths must be different".to_string());
     }
 
-    let in_file = File::open(input_path).map_err(|e| format!("cannot open '{input_path}': {e}"))?;
+    let mut in_file =
+        File::open(input_path).map_err(|e| format!("cannot open '{input_path}': {e}"))?;
     let payload_total = in_file
         .metadata()
         .map(|m| m.len().saturating_sub(crypto::HEADER_LEN as u64))
         .unwrap_or(0);
-    let mut reader = BufReader::with_capacity(256 * 1024, in_file);
     let pass = ask_pass(false)?;
 
     let start = Instant::now();
     let spin = ui::Spinner::start("Unlocking header (Argon2id)");
-    let unlocked = crypto::unlock_header(&mut reader, &pass)?;
+    let unlocked = crypto::unlock_header(&mut in_file, &pass)?;
     spin.finish();
 
-    let out_file =
-        File::create(&output_path).map_err(|e| format!("cannot create '{output_path}': {e}"))?;
-    let mut writer = BufWriter::with_capacity(256 * 1024, out_file);
+    let (mut tmp_file, tmp_path) = create_temp_file(&output_path)?;
     let mut bar = ui::Progress::new("dec", payload_total);
 
-    let res = crypto::open_payload(&mut reader, &mut writer, &unlocked, |done| bar.update(done));
+    let res = crypto::open_payload(&mut in_file, &mut tmp_file, &unlocked, |done| {
+        bar.update(done)
+    });
     bar.finish();
 
     let stats = match res {
         Ok(s) => s,
         Err(e) => {
-            drop(writer);
-            let _ = fs::remove_file(&output_path);
+            drop(tmp_file);
+            let _ = fs::remove_file(&tmp_path);
             return Err(e);
         }
     };
 
-    writer
-        .flush()
-        .map_err(|e| format!("cannot flush '{output_path}': {e}"))?;
+    if let Err(e) = tmp_file.sync_all() {
+        drop(tmp_file);
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!("cannot sync output: {e}"));
+    }
+    drop(tmp_file);
+
+    if let Err(e) = fs::rename(&tmp_path, &output_path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!("cannot finalize '{output_path}': {e}"));
+    }
 
     ui::print_op("dec", &format!("{input_path} → {output_path}"));
     ui::print_line(
@@ -292,7 +339,7 @@ fn run_seal(text: &str) -> Result<(), String> {
     let (sealed, mac) = crypto::seal_bytes(text.as_bytes(), &pass)?;
     spin.finish();
 
-    let token = format!("knx3:{}", crypto::b64_encode(&sealed));
+    let token = format!("knx4:{}", crypto::b64_encode(&sealed));
 
     ui::print_op("seal", &format!("{} bytes armored", text.len()));
     ui::print_line("token", &token, false);
@@ -301,9 +348,9 @@ fn run_seal(text: &str) -> Result<(), String> {
 }
 
 fn run_open(token: &str) -> Result<(), String> {
-    let payload = match token.strip_prefix("knx3:") {
+    let payload = match token.strip_prefix("knx4:") {
         Some(p) => p,
-        None => return Err("expected token starting with 'knx3:'".to_string()),
+        None => return Err("expected token starting with 'knx4:'".to_string()),
     };
     let raw = crypto::b64_decode(payload)?;
     let pass = ask_pass(false)?;
@@ -336,6 +383,16 @@ fn run_info(args: &[String]) -> Result<(), String> {
 
     ui::print_op("info", path);
     ui::print_line("format", &format!("KNOX v{} (BLAKE3 STREAM)", info.version), false);
+    ui::print_line(
+        "kdf",
+        &format!(
+            "Argon2id ({} MiB · t={} · p={})",
+            info.kdf.mem_mib(),
+            info.kdf.t_cost,
+            info.kdf.p_cost
+        ),
+        false,
+    );
     ui::print_line(
         "file",
         &format!("{} (~{} chunks)", ui::format_bytes(meta.len()), chunks),
@@ -386,7 +443,10 @@ fn run_bench() {
 
     spin.finish();
 
-    ui::print_op("bench", "KNOX-256 + BLAKE3 STREAM (64 KiB chunks)");
+    ui::print_op(
+        "bench",
+        &format!("KNOX-256 [{}] + BLAKE3 STREAM", cipher.backend_name()),
+    );
     ui::print_line("1-thread", &format!("{single_mib:.1} MiB/s ({blocks} blocks)"), false);
     ui::print_line(
         "stream",
