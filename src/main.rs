@@ -161,16 +161,24 @@ fn run_enc(args: &[String]) -> Result<(), String> {
     }
 
     let in_file = File::open(input_path).map_err(|e| format!("cannot open '{input_path}': {e}"))?;
+    let total_size = in_file.metadata().map(|m| m.len()).unwrap_or(0);
     let pass = ask_pass(true)?;
+
+    let start = Instant::now();
+    let spin = ui::Spinner::start("Deriving key (Argon2id)");
+    let prepared = crypto::prepare_seal(&pass)?;
+    spin.finish();
 
     let out_file =
         File::create(&output_path).map_err(|e| format!("cannot create '{output_path}': {e}"))?;
 
     let mut reader = BufReader::with_capacity(256 * 1024, in_file);
     let mut writer = BufWriter::with_capacity(256 * 1024, out_file);
+    let mut bar = ui::Progress::new("enc", total_size);
 
-    let start = Instant::now();
-    let res = crypto::seal_stream(&mut reader, &mut writer, &pass);
+    let res = crypto::seal_payload(&mut reader, &mut writer, &prepared, |done| bar.update(done));
+    bar.finish();
+
     let stats = match res {
         Ok(s) => s,
         Err(e) => {
@@ -222,17 +230,26 @@ fn run_dec(args: &[String]) -> Result<(), String> {
     }
 
     let in_file = File::open(input_path).map_err(|e| format!("cannot open '{input_path}': {e}"))?;
+    let payload_total = in_file
+        .metadata()
+        .map(|m| m.len().saturating_sub(crypto::HEADER_LEN as u64))
+        .unwrap_or(0);
     let mut reader = BufReader::with_capacity(256 * 1024, in_file);
     let pass = ask_pass(false)?;
 
     let start = Instant::now();
+    let spin = ui::Spinner::start("Unlocking header (Argon2id)");
     let unlocked = crypto::unlock_header(&mut reader, &pass)?;
+    spin.finish();
 
     let out_file =
         File::create(&output_path).map_err(|e| format!("cannot create '{output_path}': {e}"))?;
     let mut writer = BufWriter::with_capacity(256 * 1024, out_file);
+    let mut bar = ui::Progress::new("dec", payload_total);
 
-    let res = crypto::open_payload(&mut reader, &mut writer, &unlocked);
+    let res = crypto::open_payload(&mut reader, &mut writer, &unlocked, |done| bar.update(done));
+    bar.finish();
+
     let stats = match res {
         Ok(s) => s,
         Err(e) => {
@@ -271,7 +288,10 @@ fn run_seal(text: &str) -> Result<(), String> {
     }
     let pass = ask_pass(true)?;
     let start = Instant::now();
+    let spin = ui::Spinner::start("Sealing token (Argon2id)");
     let (sealed, mac) = crypto::seal_bytes(text.as_bytes(), &pass)?;
+    spin.finish();
+
     let token = format!("knx3:{}", crypto::b64_encode(&sealed));
 
     ui::print_op("seal", &format!("{} bytes armored", text.len()));
@@ -289,7 +309,10 @@ fn run_open(token: &str) -> Result<(), String> {
     let pass = ask_pass(false)?;
 
     let start = Instant::now();
+    let spin = ui::Spinner::start("Verifying token (Argon2id)");
     let (plain, mac) = crypto::open_bytes(&raw, &pass)?;
+    spin.finish();
+
     let text = std::str::from_utf8(&plain)
         .map_err(|_| "decrypted data is not valid UTF-8".to_string())?;
 
@@ -325,6 +348,8 @@ fn run_info(args: &[String]) -> Result<(), String> {
 }
 
 fn run_bench() {
+    let spin = ui::Spinner::start("Benchmarking KNOX-256 + BLAKE3 STREAM");
+
     let blocks = 500_000usize;
     let cipher = Knox256::new(&[0x4Bu8; 32]);
     let tweak = [0x7Fu8; 16];
@@ -358,6 +383,8 @@ fn run_bench() {
         }
     }
     let avg = (flips as f64) / (256.0 * 128.0) * 100.0;
+
+    spin.finish();
 
     ui::print_op("bench", "KNOX-256 + BLAKE3 STREAM (64 KiB chunks)");
     ui::print_line("1-thread", &format!("{single_mib:.1} MiB/s ({blocks} blocks)"), false);
