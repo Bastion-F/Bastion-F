@@ -118,43 +118,278 @@ impl Knox256 {
         if self.use_aesni {
             #[allow(unsafe_code)]
             unsafe {
-                return self.encrypt_block_aesni(state, tweak);
+                return self.encrypt_chain_aesni(state, tweak, 1);
             }
         }
         self.encrypt_block_ct(state, tweak)
     }
 
+    pub fn encrypt_chain(&self, mut state: [u8; 16], tweak: [u8; 16], count: usize) -> [u8; 16] {
+        #[cfg(target_arch = "x86_64")]
+        if self.use_aesni {
+            #[allow(unsafe_code)]
+            unsafe {
+                return self.encrypt_chain_aesni(state, tweak, count);
+            }
+        }
+        for _ in 0..count {
+            state = self.encrypt_block_ct(state, tweak);
+        }
+        state
+    }
+
+    pub fn ctr_chunk(
+        &self,
+        stream_nonce: &[u8; 16],
+        chunk_idx: u64,
+        is_last: bool,
+        data: &mut [u8],
+    ) {
+        #[cfg(target_arch = "x86_64")]
+        if self.use_aesni {
+            #[allow(unsafe_code)]
+            unsafe {
+                self.ctr_chunk_aesni(stream_nonce, chunk_idx, is_last, data);
+                return;
+            }
+        }
+        self.ctr_chunk_ct(stream_nonce, chunk_idx, is_last, data);
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "aes")]
     #[allow(unsafe_code)]
-    unsafe fn encrypt_block_aesni(&self, state: [u8; 16], tweak: [u8; 16]) -> [u8; 16] {
+    unsafe fn encrypt_chain_aesni(
+        &self,
+        state: [u8; 16],
+        tweak: [u8; 16],
+        count: usize,
+    ) -> [u8; 16] {
         use std::arch::x86_64::*;
 
-        let tw = split_tweak(tweak);
         let zero = _mm_setzero_si128();
-        let mut l = read_u64(&state[0..8]) ^ self.keys[0][0];
-        let mut r = read_u64(&state[8..16]) ^ self.keys[0][1];
+        let tw = split_tweak(tweak);
 
-        for round in 1..=ROUNDS {
-            let v = _mm_set_epi64x(r as i64, l as i64);
-            let mixed = _mm_aesenc_si128(v, zero);
-            l = _mm_cvtsi128_si64(mixed) as u64;
-            r = _mm_cvtsi128_si64(_mm_unpackhi_epi64(mixed, mixed)) as u64;
+        let mut tw_r = [zero; ROUNDS];
+        for r in 1..=ROUNDS {
+            let w = tw[r % 3].wrapping_add((r as u64).wrapping_mul(ROUND_SALT));
+            tw_r[r - 1] = _mm_cvtsi64_si128(w as i64);
+        }
 
-            let tw_word = tw[round % 3].wrapping_add((round as u64).wrapping_mul(ROUND_SALT));
-            l = l.wrapping_add(r);
-            r = r.rotate_left(13) ^ l;
-            r = r.wrapping_add(tw_word);
-            l = l.rotate_left(31) ^ r;
+        let mut rk = [zero; ROUNDS + 1];
+        for r in 0..=ROUNDS {
+            rk[r] = _mm_loadu_si128(self.keys[r].as_ptr() as *const __m128i);
+        }
 
-            l ^= self.keys[round][0];
-            r ^= self.keys[round][1];
+        let mut v = _mm_loadu_si128(state.as_ptr() as *const __m128i);
+
+        for _ in 0..count {
+            v = _mm_xor_si128(v, rk[0]);
+            for round in 1..=ROUNDS {
+                let m = _mm_aesenc_si128(v, zero);
+                let r0 = _mm_srli_si128::<8>(m);
+                let l1 = _mm_add_epi64(m, r0);
+                let r_rot = _mm_or_si128(_mm_slli_epi64::<13>(r0), _mm_srli_epi64::<51>(r0));
+                let r1 = _mm_xor_si128(r_rot, l1);
+                let r2 = _mm_add_epi64(r1, tw_r[round - 1]);
+                let l_rot = _mm_or_si128(_mm_slli_epi64::<31>(l1), _mm_srli_epi64::<33>(l1));
+                let l2 = _mm_xor_si128(l_rot, r2);
+                v = _mm_xor_si128(_mm_unpacklo_epi64(l2, r2), rk[round]);
+            }
         }
 
         let mut out = [0u8; 16];
-        out[0..8].copy_from_slice(&l.to_le_bytes());
-        out[8..16].copy_from_slice(&r.to_le_bytes());
+        _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, v);
         out
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "aes")]
+    #[allow(unsafe_code)]
+    unsafe fn ctr_chunk_aesni(
+        &self,
+        stream_nonce: &[u8; 16],
+        chunk_idx: u64,
+        is_last: bool,
+        data: &mut [u8],
+    ) {
+        use std::arch::x86_64::*;
+
+        let zero = _mm_setzero_si128();
+        let golden_v = _mm_set1_epi64x(GOLDEN as i64);
+
+        let base_lo = read_u64(&stream_nonce[0..8]);
+        let base_mid = read_u32(&stream_nonce[8..12]);
+        let last_mask = if is_last { 0xFFu8 } else { 0x00u8 };
+        let hi_top = u32::from_le_bytes([
+            stream_nonce[12],
+            stream_nonce[13],
+            stream_nonce[14],
+            stream_nonce[15] ^ last_mask,
+        ]) as u64;
+        let hi_shifted = hi_top << 32;
+
+        let t0 = base_lo ^ chunk_idx;
+        let tw_t0 = _mm_set1_epi64x(t0 as i64);
+
+        let k0 = _mm_loadu_si128(self.keys[0].as_ptr() as *const __m128i);
+        let mut kl = [zero; ROUNDS + 1];
+        let mut kr = [zero; ROUNDS + 1];
+        let mut rs = [zero; ROUNDS];
+
+        for r in 1..=ROUNDS {
+            kl[r] = _mm_set1_epi64x(self.keys[r][0] as i64);
+            kr[r] = _mm_set1_epi64x(self.keys[r][1] as i64);
+            rs[r - 1] = _mm_set1_epi64x((r as u64).wrapping_mul(ROUND_SALT) as i64);
+        }
+
+        let main_len = (data.len() / 64) * 64;
+        let (main_data, rem) = data.split_at_mut(main_len);
+        let mut b = 0u32;
+
+        for chunk64 in main_data.chunks_exact_mut(64) {
+            let c0 = (b as u64) | hi_shifted;
+            let c1 = ((b + 1) as u64) | hi_shifted;
+            let c2 = ((b + 2) as u64) | hi_shifted;
+            let c3 = ((b + 3) as u64) | hi_shifted;
+
+            let mut v0 = _mm_xor_si128(_mm_set_epi64x(c0 as i64, chunk_idx as i64), k0);
+            let mut v1 = _mm_xor_si128(_mm_set_epi64x(c1 as i64, chunk_idx as i64), k0);
+            let mut v2 = _mm_xor_si128(_mm_set_epi64x(c2 as i64, chunk_idx as i64), k0);
+            let mut v3 = _mm_xor_si128(_mm_set_epi64x(c3 as i64, chunk_idx as i64), k0);
+
+            let t1_0 = ((base_mid ^ b) as u64) | hi_shifted;
+            let t1_1 = ((base_mid ^ (b + 1)) as u64) | hi_shifted;
+            let t1_2 = ((base_mid ^ (b + 2)) as u64) | hi_shifted;
+            let t1_3 = ((base_mid ^ (b + 3)) as u64) | hi_shifted;
+
+            let tw01_1 = _mm_set_epi64x(t1_1 as i64, t1_0 as i64);
+            let tw23_1 = _mm_set_epi64x(t1_3 as i64, t1_2 as i64);
+            let tw01_2 = _mm_xor_si128(_mm_xor_si128(tw_t0, tw01_1), golden_v);
+            let tw23_2 = _mm_xor_si128(_mm_xor_si128(tw_t0, tw23_1), golden_v);
+
+            let tw01 = [tw_t0, tw01_1, tw01_2];
+            let tw23 = [tw_t0, tw23_1, tw23_2];
+
+            for round in 1..=ROUNDS {
+                v0 = _mm_aesenc_si128(v0, zero);
+                v1 = _mm_aesenc_si128(v1, zero);
+                v2 = _mm_aesenc_si128(v2, zero);
+                v3 = _mm_aesenc_si128(v3, zero);
+
+                let mut l01 = _mm_unpacklo_epi64(v0, v1);
+                let mut r01 = _mm_unpackhi_epi64(v0, v1);
+                let mut l23 = _mm_unpacklo_epi64(v2, v3);
+                let mut r23 = _mm_unpackhi_epi64(v2, v3);
+
+                let tw_a = _mm_add_epi64(tw01[round % 3], rs[round - 1]);
+                let tw_b = _mm_add_epi64(tw23[round % 3], rs[round - 1]);
+
+                l01 = _mm_add_epi64(l01, r01);
+                l23 = _mm_add_epi64(l23, r23);
+
+                let rot_r01 = _mm_or_si128(_mm_slli_epi64::<13>(r01), _mm_srli_epi64::<51>(r01));
+                let rot_r23 = _mm_or_si128(_mm_slli_epi64::<13>(r23), _mm_srli_epi64::<51>(r23));
+                r01 = _mm_xor_si128(rot_r01, l01);
+                r23 = _mm_xor_si128(rot_r23, l23);
+
+                r01 = _mm_add_epi64(r01, tw_a);
+                r23 = _mm_add_epi64(r23, tw_b);
+
+                let rot_l01 = _mm_or_si128(_mm_slli_epi64::<31>(l01), _mm_srli_epi64::<33>(l01));
+                let rot_l23 = _mm_or_si128(_mm_slli_epi64::<31>(l23), _mm_srli_epi64::<33>(l23));
+                l01 = _mm_xor_si128(rot_l01, r01);
+                l23 = _mm_xor_si128(rot_l23, r23);
+
+                l01 = _mm_xor_si128(l01, kl[round]);
+                r01 = _mm_xor_si128(r01, kr[round]);
+                l23 = _mm_xor_si128(l23, kl[round]);
+                r23 = _mm_xor_si128(r23, kr[round]);
+
+                v0 = _mm_unpacklo_epi64(l01, r01);
+                v1 = _mm_unpackhi_epi64(l01, r01);
+                v2 = _mm_unpacklo_epi64(l23, r23);
+                v3 = _mm_unpackhi_epi64(l23, r23);
+            }
+
+            let ptr = chunk64.as_mut_ptr();
+            let p0 = _mm_loadu_si128(ptr as *const __m128i);
+            let p1 = _mm_loadu_si128(ptr.add(16) as *const __m128i);
+            let p2 = _mm_loadu_si128(ptr.add(32) as *const __m128i);
+            let p3 = _mm_loadu_si128(ptr.add(48) as *const __m128i);
+
+            _mm_storeu_si128(ptr as *mut __m128i, _mm_xor_si128(p0, v0));
+            _mm_storeu_si128(ptr.add(16) as *mut __m128i, _mm_xor_si128(p1, v1));
+            _mm_storeu_si128(ptr.add(32) as *mut __m128i, _mm_xor_si128(p2, v2));
+            _mm_storeu_si128(ptr.add(48) as *mut __m128i, _mm_xor_si128(p3, v3));
+
+            b += 4;
+        }
+
+        if !rem.is_empty() {
+            let mut rk = [zero; ROUNDS + 1];
+            for r in 0..=ROUNDS {
+                rk[r] = _mm_loadu_si128(self.keys[r].as_ptr() as *const __m128i);
+            }
+
+            for block in rem.chunks_mut(16) {
+                let ctr_hi = (b as u64) | hi_shifted;
+                let t1 = ((base_mid ^ b) as u64) | hi_shifted;
+                let tw = [t0, t1, t0 ^ t1 ^ GOLDEN];
+
+                let mut v = _mm_xor_si128(_mm_set_epi64x(ctr_hi as i64, chunk_idx as i64), rk[0]);
+                for round in 1..=ROUNDS {
+                    let tw_w = tw[round % 3].wrapping_add((round as u64).wrapping_mul(ROUND_SALT));
+                    let m = _mm_aesenc_si128(v, zero);
+                    let r0 = _mm_srli_si128::<8>(m);
+                    let l1 = _mm_add_epi64(m, r0);
+                    let r_rot = _mm_or_si128(_mm_slli_epi64::<13>(r0), _mm_srli_epi64::<51>(r0));
+                    let r1 = _mm_xor_si128(r_rot, l1);
+                    let r2 = _mm_add_epi64(r1, _mm_cvtsi64_si128(tw_w as i64));
+                    let l_rot = _mm_or_si128(_mm_slli_epi64::<31>(l1), _mm_srli_epi64::<33>(l1));
+                    let l2 = _mm_xor_si128(l_rot, r2);
+                    v = _mm_xor_si128(_mm_unpacklo_epi64(l2, r2), rk[round]);
+                }
+
+                let mut ks = [0u8; 16];
+                _mm_storeu_si128(ks.as_mut_ptr() as *mut __m128i, v);
+                for j in 0..block.len() {
+                    block[j] ^= ks[j];
+                }
+                b += 1;
+            }
+        }
+    }
+
+    pub fn ctr_chunk_ct(
+        &self,
+        stream_nonce: &[u8; 16],
+        chunk_idx: u64,
+        is_last: bool,
+        data: &mut [u8],
+    ) {
+        let base_lo = read_u64(&stream_nonce[0..8]);
+        let base_mid = read_u32(&stream_nonce[8..12]);
+        let last_mask = if is_last { 0xFFu8 } else { 0x00u8 };
+
+        for (b, block) in data.chunks_mut(16).enumerate() {
+            let b_u32 = b as u32;
+            let mut ctr = [0u8; 16];
+            ctr[0..8].copy_from_slice(&chunk_idx.to_le_bytes());
+            ctr[8..12].copy_from_slice(&b_u32.to_le_bytes());
+            ctr[12..15].copy_from_slice(&stream_nonce[12..15]);
+            ctr[15] = stream_nonce[15] ^ last_mask;
+
+            let mut tweak = *stream_nonce;
+            tweak[0..8].copy_from_slice(&(base_lo ^ chunk_idx).to_le_bytes());
+            tweak[8..12].copy_from_slice(&(base_mid ^ b_u32).to_le_bytes());
+            tweak[15] ^= last_mask;
+
+            let ks = self.encrypt_block_ct(ctr, tweak);
+            for j in 0..block.len() {
+                block[j] ^= ks[j];
+            }
+        }
     }
 
     pub fn encrypt_block_ct(&self, mut state: [u8; 16], tweak: [u8; 16]) -> [u8; 16] {
@@ -189,6 +424,12 @@ impl Knox256 {
         xor_key(&mut state, &self.keys[0]);
         state
     }
+}
+
+fn read_u32(slice: &[u8]) -> u32 {
+    let mut buf = [0u8; 4];
+    buf.copy_from_slice(slice);
+    u32::from_le_bytes(buf)
 }
 
 fn read_u64(slice: &[u8]) -> u64 {
@@ -343,6 +584,20 @@ mod tests {
         assert_eq!(ct, ct_sw);
         assert_ne!(ct, pt);
         assert_eq!(cipher.decrypt_block(ct, tweak), pt);
+    }
+
+    #[test]
+    fn test_ctr_chunk_4x_matches_scalar() {
+        let cipher = Knox256::new(&[0x7Au8; 32]);
+        let nonce = [0x3Cu8; 16];
+
+        for is_last in [false, true] {
+            let mut fast = vec![0x5Au8; 317];
+            let mut slow = fast.clone();
+            cipher.ctr_chunk(&nonce, 42, is_last, &mut fast);
+            cipher.ctr_chunk_ct(&nonce, 42, is_last, &mut slow);
+            assert_eq!(fast, slow);
+        }
     }
 
     #[test]
