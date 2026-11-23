@@ -4,6 +4,7 @@ mod crypto;
 mod ui;
 
 use crypto::cipher::Knox256;
+use crypto::HeaderKind;
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::hint::black_box;
@@ -26,6 +27,7 @@ fn main() {
     let rest = &args[1..];
 
     let res = match cmd {
+        "keygen" => run_keygen(rest),
         "enc" | "encrypt" => run_enc(rest),
         "dec" | "decrypt" => run_dec(rest),
         "info" | "inspect" => run_info(rest),
@@ -97,6 +99,10 @@ fn run_repl() {
                 run_bench();
                 Ok(())
             }
+            "/keygen" => {
+                let parts: Vec<String> = tail.split_whitespace().map(|s| s.to_string()).collect();
+                run_keygen(&parts)
+            }
             "/enc" => {
                 let parts: Vec<String> = tail.split_whitespace().map(|s| s.to_string()).collect();
                 run_enc(&parts)
@@ -143,6 +149,72 @@ fn ask_pass(confirm: bool) -> Result<Zeroizing<String>, String> {
     Ok(p1)
 }
 
+fn ask_identity() -> Result<Zeroizing<[u8; 32]>, String> {
+    let input = rpassword::prompt_password(format!(
+        "  {}identity (file or knxsec):{} ",
+                                                   ui::MUTED,
+                                                   ui::RESET
+    ))
+    .map_err(|e| format!("tty error: {e}"))?;
+    let input = Zeroizing::new(input);
+    resolve_sec_key(input.trim())
+}
+
+fn resolve_pub_key(spec: &str) -> Result<[u8; 32], String> {
+    if spec.starts_with("knxpub:") {
+        return crypto::decode_pub(spec);
+    }
+    let content = fs::read_to_string(spec)
+    .map_err(|e| format!("cannot read public key from '{spec}': {e}"))?;
+    for line in content.lines() {
+        if let Some(pos) = line.find("knxpub:") {
+            let token = line[pos..].split_whitespace().next().unwrap_or("");
+            return crypto::decode_pub(token);
+        }
+    }
+    Err(format!("no 'knxpub:' key found in '{spec}'"))
+}
+
+fn resolve_sec_key(spec: &str) -> Result<Zeroizing<[u8; 32]>, String> {
+    if spec.is_empty() {
+        return Err("empty identity rejected".to_string());
+    }
+    if spec.starts_with("knxsec:") {
+        return crypto::decode_sec(spec);
+    }
+    let raw = fs::read_to_string(spec)
+    .map_err(|e| format!("cannot read identity file '{spec}': {e}"))?;
+    let content = Zeroizing::new(raw);
+    for line in content.lines() {
+        let t = line.trim();
+        if t.starts_with("knxsec:") {
+            return crypto::decode_sec(t);
+        }
+    }
+    Err(format!("no 'knxsec:' key found in '{spec}'"))
+}
+
+fn parse_flag_args(args: &[String], flag: &str) -> Result<(Option<String>, Vec<String>), String> {
+    let mut flag_val: Option<String> = None;
+    let mut pos = Vec::new();
+    let mut i = 0;
+
+    while i < args.len() {
+        if args[i] == flag {
+            if i + 1 >= args.len() {
+                return Err(format!("missing value after '{flag}'"));
+            }
+            flag_val = Some(args[i + 1].clone());
+            i += 2;
+        } else {
+            pos.push(args[i].clone());
+            i += 1;
+        }
+    }
+
+    Ok((flag_val, pos))
+}
+
 fn same_path(a: &str, b: &str) -> bool {
     if a == b {
         return true;
@@ -174,13 +246,52 @@ fn create_temp_file(target: &str) -> Result<(File, PathBuf), String> {
     Ok((file, tmp_path))
 }
 
-fn run_enc(args: &[String]) -> Result<(), String> {
-    if args.is_empty() {
-        return Err("usage: enc <file> [out]".to_string());
+fn run_keygen(args: &[String]) -> Result<(), String> {
+    let start = Instant::now();
+    let (sec, pub_bytes) = crypto::generate_keypair()?;
+    let pub_str = crypto::encode_pub(&pub_bytes);
+    let sec_str = crypto::encode_sec(&sec);
+
+    if let Some(path) = args.first() {
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            opts.mode(0o600);
+        }
+
+        let mut file = opts
+        .open(path)
+        .map_err(|e| format!("cannot create keyfile '{path}': {e}"))?;
+
+        let body = Zeroizing::new(format!("# public: {pub_str}\n{}\n", &*sec_str));
+        if let Err(e) = file.write_all(body.as_bytes()).and_then(|_| file.sync_all()) {
+            drop(file);
+            let _ = fs::remove_file(path);
+            return Err(format!("cannot write keyfile '{path}': {e}"));
+        }
+
+        ui::print_op("keygen", &format!("X25519 identity → {path}"));
+        ui::print_line("public", &pub_str, false);
+        ui::print_done("mode", "0600 (saved)", start.elapsed());
+    } else {
+        ui::print_op("keygen", "X25519 identity");
+        ui::print_line("public", &pub_str, false);
+        ui::print_line("secret", &sec_str, false);
+        ui::print_done("status", "ready (save secret safely)", start.elapsed());
     }
-    let input_path = &args[0];
-    let output_path = if args.len() > 1 {
-        args[1].clone()
+
+    Ok(())
+}
+
+fn run_enc(args: &[String]) -> Result<(), String> {
+    let (recipient, pos) = parse_flag_args(args, "-r")?;
+    if pos.is_empty() {
+        return Err("usage: enc [-r <knxpub|keyfile>] <file> [out]".to_string());
+    }
+    let input_path = &pos[0];
+    let output_path = if pos.len() > 1 {
+        pos[1].clone()
     } else {
         format!("{input_path}.knx")
     };
@@ -192,12 +303,20 @@ fn run_enc(args: &[String]) -> Result<(), String> {
     let mut in_file =
     File::open(input_path).map_err(|e| format!("cannot open '{input_path}': {e}"))?;
     let total_size = in_file.metadata().map(|m| m.len()).unwrap_or(0);
-    let pass = ask_pass(true)?;
 
-    let start = Instant::now();
-    let spin = ui::Spinner::start("Deriving key (Argon2id)");
-    let prepared = crypto::prepare_seal(&pass)?;
-    spin.finish();
+    let (prepared, mode_label, start) = if let Some(ref rec) = recipient {
+        let pub_key = resolve_pub_key(rec)?;
+        let start = Instant::now();
+        let prep = crypto::prepare_seal_x25519(&pub_key)?;
+        (prep, "X25519", start)
+    } else {
+        let pass = ask_pass(true)?;
+        let start = Instant::now();
+        let spin = ui::Spinner::start("Deriving key (Argon2id)");
+        let prep = crypto::prepare_seal_pass(&pass)?;
+        spin.finish();
+        (prep, "Argon2id", start)
+    };
 
     let (mut tmp_file, tmp_path) = create_temp_file(&output_path)?;
     let mut bar = ui::Progress::new("enc", total_size);
@@ -231,7 +350,7 @@ fn run_enc(args: &[String]) -> Result<(), String> {
     ui::print_op("enc", &format!("{input_path} → {output_path}"));
     ui::print_line(
         "cipher",
-        &format!("KNOX-256 [{}] + Argon2id + BLAKE3", active_backend()),
+        &format!("KNOX-256 [{}] + {mode_label} + BLAKE3", active_backend()),
                    false,
     );
     ui::print_line(
@@ -253,12 +372,13 @@ fn run_enc(args: &[String]) -> Result<(), String> {
 }
 
 fn run_dec(args: &[String]) -> Result<(), String> {
-    if args.is_empty() {
-        return Err("usage: dec <file.knx> [out]".to_string());
+    let (identity, pos) = parse_flag_args(args, "-i")?;
+    if pos.is_empty() {
+        return Err("usage: dec [-i <keyfile|knxsec>] <file.knx> [out]".to_string());
     }
-    let input_path = &args[0];
-    let output_path = if args.len() > 1 {
-        args[1].clone()
+    let input_path = &pos[0];
+    let output_path = if pos.len() > 1 {
+        pos[1].clone()
     } else if let Some(stripped) = input_path.strip_suffix(".knx") {
         stripped.to_string()
     } else {
@@ -271,17 +391,33 @@ fn run_dec(args: &[String]) -> Result<(), String> {
 
     let mut in_file =
     File::open(input_path).map_err(|e| format!("cannot open '{input_path}': {e}"))?;
-    let payload_total = in_file
-    .metadata()
-    .map(|m| m.len().saturating_sub(crypto::HEADER_LEN as u64))
-    .unwrap_or(0);
-    let pass = ask_pass(false)?;
+    let file_size = in_file.metadata().map(|m| m.len()).unwrap_or(0);
+    let (raw_hdr, info) = crypto::read_header_raw(&mut in_file)?;
 
-    let start = Instant::now();
-    let spin = ui::Spinner::start("Unlocking header (Argon2id)");
-    let unlocked = crypto::unlock_header(&mut in_file, &pass)?;
-    spin.finish();
+    let (unlocked, start) = match info.kind {
+        HeaderKind::Passphrase { .. } => {
+            if identity.is_some() {
+                return Err("this container uses a passphrase (remove -i)".to_string());
+            }
+            let pass = ask_pass(false)?;
+            let start = Instant::now();
+            let spin = ui::Spinner::start("Unlocking header (Argon2id)");
+            let u = crypto::unlock_passphrase(&raw_hdr, &info, &pass)?;
+            spin.finish();
+            (u, start)
+        }
+        HeaderKind::X25519 { .. } => {
+            let sec = match identity {
+                Some(ref spec) => resolve_sec_key(spec)?,
+                None => ask_identity()?,
+            };
+            let start = Instant::now();
+            let u = crypto::unlock_x25519(&raw_hdr, &info, &sec)?;
+            (u, start)
+        }
+    };
 
+    let payload_total = file_size.saturating_sub(unlocked.header_len as u64);
     let (mut tmp_file, tmp_path) = create_temp_file(&output_path)?;
     let mut bar = ui::Progress::new("dec", payload_total);
 
@@ -332,12 +468,34 @@ fn run_dec(args: &[String]) -> Result<(), String> {
 
 fn run_seal(text: &str) -> Result<(), String> {
     if text.is_empty() {
-        return Err("usage: /seal <plaintext>".to_string());
+        return Err("usage: /seal [-r <knxpub|keyfile>] <plaintext>".to_string());
     }
+
+    if let Some(after) = text.strip_prefix("-r ") {
+        let (rec, msg) = after
+        .trim_start()
+        .split_once(char::is_whitespace)
+        .ok_or("usage: /seal -r <knxpub|keyfile> <plaintext>")?;
+        let msg = msg.trim_start();
+        if msg.is_empty() {
+            return Err("usage: /seal -r <knxpub|keyfile> <plaintext>".to_string());
+        }
+
+        let pub_key = resolve_pub_key(rec)?;
+        let start = Instant::now();
+        let (sealed, mac) = crypto::seal_bytes_x25519(msg.as_bytes(), &pub_key)?;
+        let token = format!("knx5:{}", crypto::b64_encode(&sealed));
+
+        ui::print_op("seal", &format!("{} bytes armored (X25519)", msg.len()));
+        ui::print_line("token", &token, false);
+        ui::print_done("hdr-mac", &crypto::hex_short(&mac), start.elapsed());
+        return Ok(());
+    }
+
     let pass = ask_pass(true)?;
     let start = Instant::now();
     let spin = ui::Spinner::start("Sealing token (Argon2id)");
-    let (sealed, mac) = crypto::seal_bytes(text.as_bytes(), &pass)?;
+    let (sealed, mac) = crypto::seal_bytes_pass(text.as_bytes(), &pass)?;
     spin.finish();
 
     let token = format!("knx4:{}", crypto::b64_encode(&sealed));
@@ -348,26 +506,55 @@ fn run_seal(text: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn run_open(token: &str) -> Result<(), String> {
-    let payload = match token.strip_prefix("knx4:") {
-        Some(p) => p,
-        None => return Err("expected token starting with 'knx4:'".to_string()),
+fn run_open(text: &str) -> Result<(), String> {
+    if text.is_empty() {
+        return Err("usage: /open [-i <keyfile|knxsec>] <knx4:...|knx5:...>".to_string());
+    }
+
+    let (identity, token) = if let Some(after) = text.strip_prefix("-i ") {
+        let (id, tok) = after
+        .trim_start()
+        .split_once(char::is_whitespace)
+        .ok_or("usage: /open -i <keyfile|knxsec> <token>")?;
+        (Some(id.to_string()), tok.trim())
+    } else {
+        (None, text.trim())
     };
-    let raw = crypto::b64_decode(payload)?;
-    let pass = ask_pass(false)?;
 
-    let start = Instant::now();
-    let spin = ui::Spinner::start("Verifying token (Argon2id)");
-    let (plain, mac) = crypto::open_bytes(&raw, &pass)?;
-    spin.finish();
+    if let Some(payload) = token.strip_prefix("knx4:") {
+        let raw = crypto::b64_decode(payload)?;
+        let pass = ask_pass(false)?;
+        let start = Instant::now();
+        let spin = ui::Spinner::start("Verifying token (Argon2id)");
+        let (plain, mac) = crypto::open_bytes_pass(&raw, &pass)?;
+        spin.finish();
 
-    let text = std::str::from_utf8(&plain)
-    .map_err(|_| "decrypted data is not valid UTF-8".to_string())?;
+        let out = std::str::from_utf8(&plain)
+        .map_err(|_| "decrypted data is not valid UTF-8".to_string())?;
+        ui::print_op("open", "armored token verified (Argon2id)");
+        ui::print_line("output", out, false);
+        ui::print_done("hdr-mac", &crypto::hex_short(&mac), start.elapsed());
+        return Ok(());
+    }
 
-    ui::print_op("open", "armored token verified");
-    ui::print_line("output", text, false);
-    ui::print_done("hdr-mac", &crypto::hex_short(&mac), start.elapsed());
-    Ok(())
+    if let Some(payload) = token.strip_prefix("knx5:") {
+        let raw = crypto::b64_decode(payload)?;
+        let sec = match identity {
+            Some(ref spec) => resolve_sec_key(spec)?,
+            None => ask_identity()?,
+        };
+        let start = Instant::now();
+        let (plain, mac) = crypto::open_bytes_x25519(&raw, &sec)?;
+
+        let out = std::str::from_utf8(&plain)
+        .map_err(|_| "decrypted data is not valid UTF-8".to_string())?;
+        ui::print_op("open", "armored token verified (X25519)");
+        ui::print_line("output", out, false);
+        ui::print_done("hdr-mac", &crypto::hex_short(&mac), start.elapsed());
+        return Ok(());
+    }
+
+    Err("expected token starting with 'knx4:' or 'knx5:'".to_string())
 }
 
 fn run_info(args: &[String]) -> Result<(), String> {
@@ -377,29 +564,37 @@ fn run_info(args: &[String]) -> Result<(), String> {
     let path = &args[0];
     let meta = fs::metadata(path).map_err(|e| format!("cannot stat '{path}': {e}"))?;
     let mut file = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
-    let info = crypto::inspect_reader(&mut file)?;
+    let (_, info) = crypto::read_header_raw(&mut file)?;
 
-    let body_len = meta.len().saturating_sub(crypto::HEADER_LEN as u64);
+    let body_len = meta.len().saturating_sub(info.header_len as u64);
     let chunks = (body_len + (crypto::ENC_CHUNK_SIZE as u64) - 1) / (crypto::ENC_CHUNK_SIZE as u64);
 
     ui::print_op("info", path);
-    ui::print_line("format", &format!("KNOX v{} (BLAKE3 STREAM)", info.version), false);
-    ui::print_line(
-        "kdf",
-        &format!(
-            "Argon2id ({} MiB · t={} · p={})",
-                 info.kdf.mem_mib(),
-                 info.kdf.t_cost,
-                 info.kdf.p_cost
-        ),
-        false,
-    );
-    ui::print_line(
-        "file",
-        &format!("{} (~{} chunks)", ui::format_bytes(meta.len()), chunks),
-                   false,
-    );
-    ui::print_line("salt", &crypto::hex_short(&info.salt), false);
+    match info.kind {
+        HeaderKind::Passphrase { kdf, salt } => {
+            ui::print_line("format", &format!("KNOX v{} (Passphrase · STREAM)", info.version), false);
+            ui::print_line(
+                "kdf",
+                &format!("Argon2id ({} MiB · t={} · p={})", kdf.mem_mib(), kdf.t_cost, kdf.p_cost),
+                           false,
+            );
+            ui::print_line(
+                "file",
+                &format!("{} (~{} chunks)", ui::format_bytes(meta.len()), chunks),
+                           false,
+            );
+            ui::print_line("salt", &crypto::hex_short(&salt), false);
+        }
+        HeaderKind::X25519 { eph_pub } => {
+            ui::print_line("format", &format!("KNOX v{} (X25519 · STREAM)", info.version), false);
+            ui::print_line(
+                "file",
+                &format!("{} (~{} chunks)", ui::format_bytes(meta.len()), chunks),
+                           false,
+            );
+            ui::print_line("eph-pub", &crypto::hex_short(&eph_pub), false);
+        }
+    }
     ui::print_line("nonce", &crypto::hex_short(&info.stream_nonce), false);
     ui::print_line("hdr-mac", &crypto::hex_short(&info.header_mac), true);
     Ok(())

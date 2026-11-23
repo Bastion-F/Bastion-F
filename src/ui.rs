@@ -196,13 +196,13 @@ fn format_rate(bytes: u64, elapsed: Duration) -> String {
 
 pub fn print_banner(cwd: &str, backend: &str) {
     println!();
-    println!("  {ACCENT}▐▛███▜▌{RESET}    {BOLD}{TEXT}knox{RESET} {MUTED}v0.7.0{RESET}");
-    println!("  {ACCENT}▜█████▛▘{RESET}   {MUTED}KNOX-256 [{backend}] · Argon2id · BLAKE3 · STREAM{RESET}");
+    println!("  {ACCENT}▐▛███▜▌{RESET}    {BOLD}{TEXT}knox{RESET} {MUTED}v0.7.1{RESET}");
+    println!("  {ACCENT}▜█████▛▘{RESET}   {MUTED}KNOX-256 [{backend}] · X25519 · Argon2id · BLAKE3{RESET}");
     println!("   {ACCENT}▘▘ ▝▝{RESET}     {MUTED}constant-time · 0600 atomic I/O · {cwd}{RESET}");
     println!();
     println!("  {BORDER}──────────────────────────────────────────────────────────{RESET}");
     println!(
-        "  {MUTED}Type {TEXT}/help{MUTED} for commands, {TEXT}/seal <text>{MUTED} for quick armor, {TEXT}/quit{MUTED} to exit.{RESET}"
+        "  {MUTED}Type {TEXT}/help{MUTED} for commands, {TEXT}/keygen{MUTED} for X25519 keys, {TEXT}/quit{MUTED} to exit.{RESET}"
     );
     println!();
 }
@@ -234,14 +234,15 @@ pub fn print_err(msg: &str) {
 
 pub fn print_help() {
     println!("{MUTED}Commands:{RESET}");
-    println!("  {ACCENT}/enc{RESET}  {TEXT}<file> [out]{RESET}    {MUTED}Stream-encrypt file to .knx container{RESET}");
-    println!("  {ACCENT}/dec{RESET}  {TEXT}<file> [out]{RESET}    {MUTED}Verify & stream-decrypt .knx container{RESET}");
-    println!("  {ACCENT}/seal{RESET} {TEXT}<text>{RESET}          {MUTED}Encrypt text into knx4: armored token{RESET}");
-    println!("  {ACCENT}/open{RESET} {TEXT}<knx4:...>{RESET}      {MUTED}Decrypt knx4: armored token{RESET}");
-    println!("  {ACCENT}/info{RESET} {TEXT}<file>{RESET}          {MUTED}Inspect .knx header & Argon2id params{RESET}");
-    println!("  {ACCENT}/bench{RESET}                {MUTED}Run KNOX-256 + BLAKE3 STREAM benchmark{RESET}");
-    println!("  {ACCENT}/clear{RESET}                {MUTED}Clear terminal{RESET}");
-    println!("  {ACCENT}/quit{RESET}                 {MUTED}Exit session{RESET}");
+    println!("  {ACCENT}/keygen{RESET} {TEXT}[file]{RESET}                {MUTED}Generate X25519 keypair (0600 if saved){RESET}");
+    println!("  {ACCENT}/enc{RESET}    {TEXT}[-r <pub>] <in> [out]{RESET} {MUTED}Encrypt file (passphrase or X25519){RESET}");
+    println!("  {ACCENT}/dec{RESET}    {TEXT}[-i <key>] <in> [out]{RESET} {MUTED}Decrypt .knx container (auto-detect){RESET}");
+    println!("  {ACCENT}/seal{RESET}   {TEXT}[-r <pub>] <text>{RESET}     {MUTED}Encrypt text into knx4: or knx5: token{RESET}");
+    println!("  {ACCENT}/open{RESET}   {TEXT}[-i <key>] <token>{RESET}    {MUTED}Decrypt knx4: or knx5: armored token{RESET}");
+    println!("  {ACCENT}/info{RESET}   {TEXT}<file>{RESET}                {MUTED}Inspect .knx header & parameters{RESET}");
+    println!("  {ACCENT}/bench{RESET}                        {MUTED}Run KNOX-256 + BLAKE3 STREAM benchmark{RESET}");
+    println!("  {ACCENT}/clear{RESET}                        {MUTED}Clear terminal{RESET}");
+    println!("  {ACCENT}/quit{RESET}                         {MUTED}Exit session{RESET}");
 }
 
 pub fn format_bytes(n: u64) -> String {

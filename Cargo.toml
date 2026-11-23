@@ -1,6 +1,6 @@
 [package]
 name = "knox"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 
 [dependencies]
@@ -10,6 +10,7 @@ getrandom = "0.2"
 rayon = "1.10"
 rpassword = "7.3"
 subtle = "2.6"
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
 zeroize = { version = "1.8", features = ["derive"] }
 
 [profile.release]

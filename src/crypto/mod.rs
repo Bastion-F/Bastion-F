@@ -5,11 +5,14 @@ use cipher::Knox256;
 use rayon::prelude::*;
 use std::io::{self, Cursor, Read, Write};
 use subtle::ConstantTimeEq;
+use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
 
 pub const MAGIC: &[u8; 4] = b"KNOX";
-pub const VERSION: u8 = 4;
-pub const HEADER_LEN: usize = 120;
+pub const VERSION_PASS: u8 = 4;
+pub const VERSION_X25519: u8 = 5;
+pub const HEADER_LEN_PASS: usize = 120;
+pub const HEADER_LEN_X25519: usize = 136;
 pub const TAG_LEN: usize = 32;
 pub const CHUNK_SIZE: usize = 64 * 1024;
 pub const ENC_CHUNK_SIZE: usize = CHUNK_SIZE + TAG_LEN;
@@ -60,10 +63,15 @@ impl KdfParams {
     }
 }
 
+pub enum HeaderKind {
+    Passphrase { kdf: KdfParams, salt: [u8; 16] },
+    X25519 { eph_pub: [u8; 32] },
+}
+
 pub struct HeaderInfo {
     pub version: u8,
-    pub kdf: KdfParams,
-    pub salt: [u8; 16],
+    pub header_len: usize,
+    pub kind: HeaderKind,
     pub wrap_nonce: [u8; 16],
     pub wrapped_key: [u8; 32],
     pub stream_nonce: [u8; 16],
@@ -78,7 +86,7 @@ pub struct StreamStats {
 }
 
 pub struct PreparedSeal {
-    pub header: [u8; HEADER_LEN],
+    pub header: Vec<u8>,
     pub enc_key: Zeroizing<[u8; 32]>,
     pub mac_key: Zeroizing<[u8; 32]>,
     pub stream_nonce: [u8; 16],
@@ -86,6 +94,7 @@ pub struct PreparedSeal {
 }
 
 pub struct UnlockedStream {
+    pub header_len: usize,
     pub enc_key: Zeroizing<[u8; 32]>,
     pub mac_key: Zeroizing<[u8; 32]>,
     pub stream_nonce: [u8; 16],
@@ -106,6 +115,50 @@ pub fn random_hex(len: usize) -> Result<String, String> {
     Ok(out)
 }
 
+pub fn generate_keypair() -> Result<(Zeroizing<[u8; 32]>, [u8; 32]), String> {
+    let mut sec_bytes = Zeroizing::new([0u8; 32]);
+    fill_rand(&mut *sec_bytes)?;
+    let sec = StaticSecret::from(*sec_bytes);
+    let pub_key = PublicKey::from(&sec);
+    Ok((sec_bytes, *pub_key.as_bytes()))
+}
+
+pub fn encode_pub(bytes: &[u8; 32]) -> String {
+    format!("knxpub:{}", b64_encode(bytes))
+}
+
+pub fn encode_sec(bytes: &[u8; 32]) -> Zeroizing<String> {
+    Zeroizing::new(format!("knxsec:{}", b64_encode(bytes)))
+}
+
+pub fn decode_pub(s: &str) -> Result<[u8; 32], String> {
+    let body = match s.trim().strip_prefix("knxpub:") {
+        Some(b) => b,
+        None => return Err("expected public key starting with 'knxpub:'".to_string()),
+    };
+    let raw = b64_decode(body)?;
+    if raw.len() != 32 {
+        return Err("invalid x25519 public key length".to_string());
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&raw);
+    Ok(out)
+}
+
+pub fn decode_sec(s: &str) -> Result<Zeroizing<[u8; 32]>, String> {
+    let body = match s.trim().strip_prefix("knxsec:") {
+        Some(b) => b,
+        None => return Err("expected secret key starting with 'knxsec:'".to_string()),
+    };
+    let raw = Zeroizing::new(b64_decode(body)?);
+    if raw.len() != 32 {
+        return Err("invalid x25519 secret key length".to_string());
+    }
+    let mut out = Zeroizing::new([0u8; 32]);
+    out.copy_from_slice(&raw);
+    Ok(out)
+}
+
 fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<usize> {
     let mut total = 0;
     while total < buf.len() {
@@ -119,7 +172,7 @@ fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<usize> {
     Ok(total)
 }
 
-fn derive_kek(
+fn derive_kek_pass(
     pass: &[u8],
     salt: &[u8; 16],
     kdf: KdfParams,
@@ -143,7 +196,27 @@ fn derive_kek(
     Ok((wrap_key, hdr_mac_key))
 }
 
+fn derive_kek_x25519(
+    shared: &[u8; 32],
+    eph_pub: &[u8; 32],
+    rec_pub: &[u8; 32],
+) -> Result<(Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>), String> {
+    if bool::from(shared.ct_eq(&[0u8; 32])) {
+        return Err("invalid low-order x25519 public key".to_string());
+    }
+
+    let mut km = Zeroizing::new([0u8; 96]);
+    km[0..32].copy_from_slice(shared);
+    km[32..64].copy_from_slice(eph_pub);
+    km[64..96].copy_from_slice(rec_pub);
+
+    let wrap_key = Zeroizing::new(blake3::derive_key("knox v5 x25519 wrap key", &*km));
+    let hdr_mac_key = Zeroizing::new(blake3::derive_key("knox v5 x25519 header mac key", &*km));
+    Ok((wrap_key, hdr_mac_key))
+}
+
 fn derive_payload_keys(
+    version: u8,
     file_key: &[u8; 32],
     stream_nonce: &[u8; 16],
 ) -> (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>) {
@@ -151,8 +224,14 @@ fn derive_payload_keys(
     km[0..32].copy_from_slice(file_key);
     km[32..48].copy_from_slice(stream_nonce);
 
-    let enc_key = Zeroizing::new(blake3::derive_key("knox v4 payload enc key", &*km));
-    let mac_key = Zeroizing::new(blake3::derive_key("knox v4 payload mac key", &*km));
+    let (enc_ctx, mac_ctx) = if version == VERSION_X25519 {
+        ("knox v5 payload enc key", "knox v5 payload mac key")
+    } else {
+        ("knox v4 payload enc key", "knox v4 payload mac key")
+    };
+
+    let enc_key = Zeroizing::new(blake3::derive_key(enc_ctx, &*km));
+    let mac_key = Zeroizing::new(blake3::derive_key(mac_ctx, &*km));
     (enc_key, mac_key)
 }
 
@@ -235,7 +314,7 @@ fn decrypt_chunk_into(
     Ok(())
 }
 
-pub fn prepare_seal(pass: &str) -> Result<PreparedSeal, String> {
+pub fn prepare_seal_pass(pass: &str) -> Result<PreparedSeal, String> {
     let kdf = KdfParams::default_v4();
     let mut salt = [0u8; 16];
     let mut wrap_nonce = [0u8; 16];
@@ -247,15 +326,15 @@ pub fn prepare_seal(pass: &str) -> Result<PreparedSeal, String> {
     fill_rand(&mut stream_nonce)?;
     fill_rand(&mut *file_key)?;
 
-    let (wrap_key, hdr_mac_key) = derive_kek(pass.as_bytes(), &salt, kdf)?;
+    let (wrap_key, hdr_mac_key) = derive_kek_pass(pass.as_bytes(), &salt, kdf)?;
     let wrap_cipher = Knox256::new(&wrap_key);
 
     let mut wrapped_key = *file_key;
     wrap_xor(&wrap_cipher, &wrap_nonce, &mut wrapped_key);
 
-    let mut header = [0u8; HEADER_LEN];
+    let mut header = vec![0u8; HEADER_LEN_PASS];
     header[0..4].copy_from_slice(MAGIC);
-    header[4] = VERSION;
+    header[4] = VERSION_PASS;
     header[5] = kdf.m_log2;
     header[6] = kdf.t_cost;
     header[7] = kdf.p_cost;
@@ -267,7 +346,52 @@ pub fn prepare_seal(pass: &str) -> Result<PreparedSeal, String> {
     let header_mac = *blake3::keyed_hash(&hdr_mac_key, &header[0..88]).as_bytes();
     header[88..120].copy_from_slice(&header_mac);
 
-    let (enc_key, mac_key) = derive_payload_keys(&file_key, &stream_nonce);
+    let (enc_key, mac_key) = derive_payload_keys(VERSION_PASS, &file_key, &stream_nonce);
+
+    Ok(PreparedSeal {
+        header,
+       enc_key,
+       mac_key,
+       stream_nonce,
+       header_mac,
+    })
+}
+
+pub fn prepare_seal_x25519(recipient_pub: &[u8; 32]) -> Result<PreparedSeal, String> {
+    let mut eph_raw = Zeroizing::new([0u8; 32]);
+    let mut wrap_nonce = [0u8; 16];
+    let mut stream_nonce = [0u8; 16];
+    let mut file_key = Zeroizing::new([0u8; 32]);
+
+    fill_rand(&mut *eph_raw)?;
+    fill_rand(&mut wrap_nonce)?;
+    fill_rand(&mut stream_nonce)?;
+    fill_rand(&mut *file_key)?;
+
+    let eph_sec = StaticSecret::from(*eph_raw);
+    let eph_pub = PublicKey::from(&eph_sec);
+    let rec_pub = PublicKey::from(*recipient_pub);
+    let shared = eph_sec.diffie_hellman(&rec_pub);
+
+    let (wrap_key, hdr_mac_key) =
+    derive_kek_x25519(shared.as_bytes(), eph_pub.as_bytes(), recipient_pub)?;
+    let wrap_cipher = Knox256::new(&wrap_key);
+
+    let mut wrapped_key = *file_key;
+    wrap_xor(&wrap_cipher, &wrap_nonce, &mut wrapped_key);
+
+    let mut header = vec![0u8; HEADER_LEN_X25519];
+    header[0..4].copy_from_slice(MAGIC);
+    header[4] = VERSION_X25519;
+    header[8..40].copy_from_slice(eph_pub.as_bytes());
+    header[40..56].copy_from_slice(&wrap_nonce);
+    header[56..88].copy_from_slice(&wrapped_key);
+    header[88..104].copy_from_slice(&stream_nonce);
+
+    let header_mac = *blake3::keyed_hash(&hdr_mac_key, &header[0..104]).as_bytes();
+    header[104..136].copy_from_slice(&header_mac);
+
+    let (enc_key, mac_key) = derive_payload_keys(VERSION_X25519, &file_key, &stream_nonce);
 
     Ok(PreparedSeal {
         header,
@@ -295,7 +419,7 @@ pub fn seal_payload<R: Read, W: Write, F: FnMut(u64)>(
     let mut pending: Option<u8> = None;
     let mut chunk_idx = 0u64;
     let mut bytes_in = 0u64;
-    let mut bytes_out = HEADER_LEN as u64;
+    let mut bytes_out = prepared.header.len() as u64;
 
     loop {
         let mut offset = 0;
@@ -394,63 +518,109 @@ pub fn seal_payload<R: Read, W: Write, F: FnMut(u64)>(
 }
 
 pub fn parse_header(raw: &[u8]) -> Result<HeaderInfo, String> {
-    if raw.len() < HEADER_LEN || &raw[0..4] != MAGIC {
+    if raw.len() < 8 || &raw[0..4] != MAGIC {
         return Err("invalid or corrupted KNOX container".to_string());
     }
-    let version = raw[4];
-    if version != VERSION {
-        return Err(format!("unsupported container version: v{version}"));
+
+    match raw[4] {
+        VERSION_PASS => {
+            if raw.len() < HEADER_LEN_PASS {
+                return Err("truncated KNOX v4 header".to_string());
+            }
+            let kdf = KdfParams {
+                m_log2: raw[5],
+                t_cost: raw[6],
+                p_cost: raw[7],
+            };
+            kdf.validate()?;
+
+            let mut salt = [0u8; 16];
+            let mut wrap_nonce = [0u8; 16];
+            let mut wrapped_key = [0u8; 32];
+            let mut stream_nonce = [0u8; 16];
+            let mut header_mac = [0u8; TAG_LEN];
+
+            salt.copy_from_slice(&raw[8..24]);
+            wrap_nonce.copy_from_slice(&raw[24..40]);
+            wrapped_key.copy_from_slice(&raw[40..72]);
+            stream_nonce.copy_from_slice(&raw[72..88]);
+            header_mac.copy_from_slice(&raw[88..120]);
+
+            Ok(HeaderInfo {
+                version: VERSION_PASS,
+                header_len: HEADER_LEN_PASS,
+                kind: HeaderKind::Passphrase { kdf, salt },
+                wrap_nonce,
+                wrapped_key,
+                stream_nonce,
+                header_mac,
+            })
+        }
+        VERSION_X25519 => {
+            if raw.len() < HEADER_LEN_X25519 {
+                return Err("truncated KNOX v5 header".to_string());
+            }
+            let mut eph_pub = [0u8; 32];
+            let mut wrap_nonce = [0u8; 16];
+            let mut wrapped_key = [0u8; 32];
+            let mut stream_nonce = [0u8; 16];
+            let mut header_mac = [0u8; TAG_LEN];
+
+            eph_pub.copy_from_slice(&raw[8..40]);
+            wrap_nonce.copy_from_slice(&raw[40..56]);
+            wrapped_key.copy_from_slice(&raw[56..88]);
+            stream_nonce.copy_from_slice(&raw[88..104]);
+            header_mac.copy_from_slice(&raw[104..136]);
+
+            Ok(HeaderInfo {
+                version: VERSION_X25519,
+                header_len: HEADER_LEN_X25519,
+                kind: HeaderKind::X25519 { eph_pub },
+                wrap_nonce,
+                wrapped_key,
+                stream_nonce,
+                header_mac,
+            })
+        }
+        v => Err(format!("unsupported container version: v{v}")),
+    }
+}
+
+pub fn read_header_raw<R: Read>(reader: &mut R) -> Result<(Vec<u8>, HeaderInfo), String> {
+    let mut prefix = [0u8; 8];
+    let n = read_full(reader, &mut prefix).map_err(|e| format!("read error: {e}"))?;
+    if n < 8 || &prefix[0..4] != MAGIC {
+        return Err("invalid or corrupted KNOX container".to_string());
     }
 
-    let kdf = KdfParams {
-        m_log2: raw[5],
-        t_cost: raw[6],
-        p_cost: raw[7],
+    let total = match prefix[4] {
+        VERSION_PASS => HEADER_LEN_PASS,
+        VERSION_X25519 => HEADER_LEN_X25519,
+        v => return Err(format!("unsupported container version: v{v}")),
     };
-    kdf.validate()?;
 
-    let mut salt = [0u8; 16];
-    let mut wrap_nonce = [0u8; 16];
-    let mut wrapped_key = [0u8; 32];
-    let mut stream_nonce = [0u8; 16];
-    let mut header_mac = [0u8; TAG_LEN];
-
-    salt.copy_from_slice(&raw[8..24]);
-    wrap_nonce.copy_from_slice(&raw[24..40]);
-    wrapped_key.copy_from_slice(&raw[40..72]);
-    stream_nonce.copy_from_slice(&raw[72..88]);
-    header_mac.copy_from_slice(&raw[88..120]);
-
-    Ok(HeaderInfo {
-        version,
-       kdf,
-       salt,
-       wrap_nonce,
-       wrapped_key,
-       stream_nonce,
-       header_mac,
-    })
-}
-
-pub fn inspect_reader<R: Read>(reader: &mut R) -> Result<HeaderInfo, String> {
-    let mut raw = [0u8; HEADER_LEN];
-    let n = read_full(reader, &mut raw).map_err(|e| format!("read error: {e}"))?;
-    if n < HEADER_LEN {
-        return Err("invalid or truncated KNOX header".to_string());
-    }
-    parse_header(&raw)
-}
-
-pub fn unlock_header<R: Read>(reader: &mut R, pass: &str) -> Result<UnlockedStream, String> {
-    let mut raw = [0u8; HEADER_LEN];
-    let n = read_full(reader, &mut raw).map_err(|e| format!("read error: {e}"))?;
-    if n < HEADER_LEN {
+    let mut raw = vec![0u8; total];
+    raw[0..8].copy_from_slice(&prefix);
+    let rest = read_full(reader, &mut raw[8..]).map_err(|e| format!("read error: {e}"))?;
+    if rest < total - 8 {
         return Err("invalid or truncated KNOX header".to_string());
     }
 
     let info = parse_header(&raw)?;
-    let (wrap_key, hdr_mac_key) = derive_kek(pass.as_bytes(), &info.salt, info.kdf)?;
+    Ok((raw, info))
+}
 
+pub fn unlock_passphrase(
+    raw: &[u8],
+    info: &HeaderInfo,
+    pass: &str,
+) -> Result<UnlockedStream, String> {
+    let (kdf, salt) = match info.kind {
+        HeaderKind::Passphrase { kdf, salt } => (kdf, salt),
+        _ => return Err("container requires an X25519 secret key, not a passphrase".to_string()),
+    };
+
+    let (wrap_key, hdr_mac_key) = derive_kek_pass(pass.as_bytes(), &salt, kdf)?;
     let expected_mac = *blake3::keyed_hash(&hdr_mac_key, &raw[0..88]).as_bytes();
     if !bool::from(expected_mac.ct_eq(&info.header_mac)) {
         return Err("auth failed: wrong passphrase or tampered header".to_string());
@@ -460,9 +630,45 @@ pub fn unlock_header<R: Read>(reader: &mut R, pass: &str) -> Result<UnlockedStre
     let mut file_key = Zeroizing::new(info.wrapped_key);
     wrap_xor(&wrap_cipher, &info.wrap_nonce, &mut file_key);
 
-    let (enc_key, mac_key) = derive_payload_keys(&file_key, &info.stream_nonce);
+    let (enc_key, mac_key) = derive_payload_keys(VERSION_PASS, &file_key, &info.stream_nonce);
     Ok(UnlockedStream {
-        enc_key,
+        header_len: info.header_len,
+       enc_key,
+       mac_key,
+       stream_nonce: info.stream_nonce,
+       header_mac: info.header_mac,
+    })
+}
+
+pub fn unlock_x25519(
+    raw: &[u8],
+    info: &HeaderInfo,
+    secret: &[u8; 32],
+) -> Result<UnlockedStream, String> {
+    let eph_pub = match info.kind {
+        HeaderKind::X25519 { eph_pub } => eph_pub,
+        _ => return Err("container requires a passphrase, not an X25519 key".to_string()),
+    };
+
+    let sec = StaticSecret::from(*secret);
+    let rec_pub = PublicKey::from(&sec);
+    let shared = sec.diffie_hellman(&PublicKey::from(eph_pub));
+
+    let (wrap_key, hdr_mac_key) =
+    derive_kek_x25519(shared.as_bytes(), &eph_pub, rec_pub.as_bytes())?;
+    let expected_mac = *blake3::keyed_hash(&hdr_mac_key, &raw[0..104]).as_bytes();
+    if !bool::from(expected_mac.ct_eq(&info.header_mac)) {
+        return Err("auth failed: wrong X25519 key or tampered header".to_string());
+    }
+
+    let wrap_cipher = Knox256::new(&wrap_key);
+    let mut file_key = Zeroizing::new(info.wrapped_key);
+    wrap_xor(&wrap_cipher, &info.wrap_nonce, &mut file_key);
+
+    let (enc_key, mac_key) = derive_payload_keys(VERSION_X25519, &file_key, &info.stream_nonce);
+    Ok(UnlockedStream {
+        header_len: info.header_len,
+       enc_key,
        mac_key,
        stream_nonce: info.stream_nonce,
        header_mac: info.header_mac,
@@ -481,7 +687,7 @@ pub fn open_payload<R: Read, W: Write, F: FnMut(u64)>(
     let mut plain_batch = Zeroizing::new(vec![0u8; BATCH_PLAIN]);
     let mut pending: Option<u8> = None;
     let mut chunk_idx = 0u64;
-    let mut bytes_in = HEADER_LEN as u64;
+    let mut bytes_in = unlocked.header_len as u64;
     let mut bytes_out = 0u64;
 
     loop {
@@ -563,7 +769,7 @@ pub fn open_payload<R: Read, W: Write, F: FnMut(u64)>(
 
         bytes_in += batch_len as u64;
         chunk_idx += count as u64;
-        on_progress(bytes_in - (HEADER_LEN as u64));
+        on_progress(bytes_in - (unlocked.header_len as u64));
 
         if is_eof {
             break;
@@ -578,17 +784,44 @@ pub fn open_payload<R: Read, W: Write, F: FnMut(u64)>(
     })
 }
 
-pub fn seal_bytes(plain: &[u8], pass: &str) -> Result<(Vec<u8>, [u8; TAG_LEN]), String> {
-    let prepared = prepare_seal(pass)?;
+pub fn seal_bytes_pass(plain: &[u8], pass: &str) -> Result<(Vec<u8>, [u8; TAG_LEN]), String> {
+    let prepared = prepare_seal_pass(pass)?;
     let mut reader = Cursor::new(plain);
-    let mut out = Vec::with_capacity(HEADER_LEN + plain.len() + TAG_LEN);
+    let mut out = Vec::with_capacity(HEADER_LEN_PASS + plain.len() + TAG_LEN);
     let stats = seal_payload(&mut reader, &mut out, &prepared, |_| {})?;
     Ok((out, stats.header_mac))
 }
 
-pub fn open_bytes(blob: &[u8], pass: &str) -> Result<(Zeroizing<Vec<u8>>, [u8; TAG_LEN]), String> {
+pub fn seal_bytes_x25519(
+    plain: &[u8],
+    recipient_pub: &[u8; 32],
+) -> Result<(Vec<u8>, [u8; TAG_LEN]), String> {
+    let prepared = prepare_seal_x25519(recipient_pub)?;
+    let mut reader = Cursor::new(plain);
+    let mut out = Vec::with_capacity(HEADER_LEN_X25519 + plain.len() + TAG_LEN);
+    let stats = seal_payload(&mut reader, &mut out, &prepared, |_| {})?;
+    Ok((out, stats.header_mac))
+}
+
+pub fn open_bytes_pass(
+    blob: &[u8],
+    pass: &str,
+) -> Result<(Zeroizing<Vec<u8>>, [u8; TAG_LEN]), String> {
     let mut reader = Cursor::new(blob);
-    let unlocked = unlock_header(&mut reader, pass)?;
+    let (raw, info) = read_header_raw(&mut reader)?;
+    let unlocked = unlock_passphrase(&raw, &info, pass)?;
+    let mut plain = Zeroizing::new(Vec::new());
+    let stats = open_payload(&mut reader, &mut *plain, &unlocked, |_| {})?;
+    Ok((plain, stats.header_mac))
+}
+
+pub fn open_bytes_x25519(
+    blob: &[u8],
+    secret: &[u8; 32],
+) -> Result<(Zeroizing<Vec<u8>>, [u8; TAG_LEN]), String> {
+    let mut reader = Cursor::new(blob);
+    let (raw, info) = read_header_raw(&mut reader)?;
+    let unlocked = unlock_x25519(&raw, &info, secret)?;
     let mut plain = Zeroizing::new(Vec::new());
     let stats = open_payload(&mut reader, &mut *plain, &unlocked, |_| {})?;
     Ok((plain, stats.header_mac))
@@ -702,15 +935,37 @@ b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
             #[test]
             fn test_empty_and_small_stream() {
-                let (sealed_empty, _) = seal_bytes(b"", "pass").unwrap();
-                let (opened_empty, _) = open_bytes(&sealed_empty, "pass").unwrap();
+                let (sealed_empty, _) = seal_bytes_pass(b"", "pass").unwrap();
+                let (opened_empty, _) = open_bytes_pass(&sealed_empty, "pass").unwrap();
                 assert!(opened_empty.is_empty());
 
                 let msg = b"avx2 + aes-ni + blake3 stream";
-                let (sealed, _) = seal_bytes(msg, "pass").unwrap();
-                let (opened, _) = open_bytes(&sealed, "pass").unwrap();
+                let (sealed, _) = seal_bytes_pass(msg, "pass").unwrap();
+                let (opened, _) = open_bytes_pass(&sealed, "pass").unwrap();
                 assert_eq!(&*opened, msg);
-                assert!(open_bytes(&sealed, "wrong").is_err());
+                assert!(open_bytes_pass(&sealed, "wrong").is_err());
+            }
+
+            #[test]
+            fn test_x25519_roundtrip_and_tamper() {
+                let (sec1, pub1) = generate_keypair().unwrap();
+                let (sec2, _) = generate_keypair().unwrap();
+
+                let pub_str = encode_pub(&pub1);
+                let sec_str = encode_sec(&sec1);
+                assert_eq!(decode_pub(&pub_str).unwrap(), pub1);
+                assert_eq!(*decode_sec(&sec_str).unwrap(), *sec1);
+
+                let msg = b"x25519 public-key wrapped file_key";
+                let (mut sealed, _) = seal_bytes_x25519(msg, &pub1).unwrap();
+                let (opened, _) = open_bytes_x25519(&sealed, &sec1).unwrap();
+                assert_eq!(&*opened, msg);
+
+                assert!(open_bytes_x25519(&sealed, &sec2).is_err());
+                assert!(open_bytes_pass(&sealed, "pass").is_err());
+
+                sealed[HEADER_LEN_X25519 + 3] ^= 1;
+                assert!(open_bytes_x25519(&sealed, &sec1).is_err());
             }
 
             #[test]
@@ -720,21 +975,21 @@ b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
                     *b = (i % 251) as u8;
                 }
 
-                let (sealed, _) = seal_bytes(&data, "stream-pass").unwrap();
-                let (opened, _) = open_bytes(&sealed, "stream-pass").unwrap();
+                let (sealed, _) = seal_bytes_pass(&data, "stream-pass").unwrap();
+                let (opened, _) = open_bytes_pass(&sealed, "stream-pass").unwrap();
                 assert_eq!(&*opened, &data);
 
-                let truncated = &sealed[..HEADER_LEN + ENC_CHUNK_SIZE];
-                assert!(open_bytes(truncated, "stream-pass").is_err());
+                let truncated = &sealed[..HEADER_LEN_PASS + ENC_CHUNK_SIZE];
+                assert!(open_bytes_pass(truncated, "stream-pass").is_err());
 
                 let mut swapped = sealed.clone();
-                let c0 = HEADER_LEN..HEADER_LEN + ENC_CHUNK_SIZE;
-                let c1 = HEADER_LEN + ENC_CHUNK_SIZE..HEADER_LEN + ENC_CHUNK_SIZE * 2;
+                let c0 = HEADER_LEN_PASS..HEADER_LEN_PASS + ENC_CHUNK_SIZE;
+                let c1 = HEADER_LEN_PASS + ENC_CHUNK_SIZE..HEADER_LEN_PASS + ENC_CHUNK_SIZE * 2;
                 let tmp = swapped[c0.clone()].to_vec();
                 let tmp2 = swapped[c1.clone()].to_vec();
                 swapped[c0].copy_from_slice(&tmp2);
                 swapped[c1].copy_from_slice(&tmp);
-                assert!(open_bytes(&swapped, "stream-pass").is_err());
+                assert!(open_bytes_pass(&swapped, "stream-pass").is_err());
             }
 
             #[test]
