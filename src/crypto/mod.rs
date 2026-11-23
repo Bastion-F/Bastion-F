@@ -126,13 +126,13 @@ fn derive_kek(
 ) -> Result<(Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>), String> {
     kdf.validate()?;
     let params = Params::new(kdf.mem_kib(), kdf.t_cost as u32, kdf.p_cost as u32, Some(32))
-        .map_err(|_| "invalid argon2 params".to_string())?;
+    .map_err(|_| "invalid argon2 params".to_string())?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
     let mut master = Zeroizing::new([0u8; 32]);
     argon
-        .hash_password_into(pass, salt, &mut *master)
-        .map_err(|_| "argon2 derivation failed".to_string())?;
+    .hash_password_into(pass, salt, &mut *master)
+    .map_err(|_| "argon2 derivation failed".to_string())?;
 
     let mut km = Zeroizing::new([0u8; 48]);
     km[0..32].copy_from_slice(&*master);
@@ -271,10 +271,10 @@ pub fn prepare_seal(pass: &str) -> Result<PreparedSeal, String> {
 
     Ok(PreparedSeal {
         header,
-        enc_key,
-        mac_key,
-        stream_nonce,
-        header_mac,
+       enc_key,
+       mac_key,
+       stream_nonce,
+       header_mac,
     })
 }
 
@@ -285,8 +285,8 @@ pub fn seal_payload<R: Read, W: Write, F: FnMut(u64)>(
     mut on_progress: F,
 ) -> Result<StreamStats, String> {
     writer
-        .write_all(&prepared.header)
-        .map_err(|e| format!("write error: {e}"))?;
+    .write_all(&prepared.header)
+    .map_err(|e| format!("write error: {e}"))?;
 
     let cipher = Knox256::new(&prepared.enc_key);
 
@@ -320,8 +320,8 @@ pub fn seal_payload<R: Read, W: Write, F: FnMut(u64)>(
                     &mut empty_tag,
                 );
                 writer
-                    .write_all(&empty_tag)
-                    .map_err(|e| format!("write error: {e}"))?;
+                .write_all(&empty_tag)
+                .map_err(|e| format!("write error: {e}"))?;
                 bytes_out += TAG_LEN as u64;
                 chunk_idx = 1;
             }
@@ -354,27 +354,27 @@ pub fn seal_payload<R: Read, W: Write, F: FnMut(u64)>(
             );
         } else {
             out_slice
-                .par_chunks_mut(ENC_CHUNK_SIZE)
-                .enumerate()
-                .for_each(|(i, dst)| {
-                    let start = i * CHUNK_SIZE;
-                    let end = (start + CHUNK_SIZE).min(batch_len);
-                    let last = is_eof && (i + 1 == count);
-                    encrypt_chunk_into(
-                        &cipher,
-                        &prepared.mac_key,
-                        &prepared.stream_nonce,
-                        base_idx + (i as u64),
-                        last,
-                        &slice[start..end],
-                        dst,
-                    );
-                });
+            .par_chunks_mut(ENC_CHUNK_SIZE)
+            .enumerate()
+            .for_each(|(i, dst)| {
+                let start = i * CHUNK_SIZE;
+                let end = (start + CHUNK_SIZE).min(batch_len);
+                let last = is_eof && (i + 1 == count);
+                encrypt_chunk_into(
+                    &cipher,
+                    &prepared.mac_key,
+                    &prepared.stream_nonce,
+                    base_idx + (i as u64),
+                                   last,
+                                   &slice[start..end],
+                                   dst,
+                );
+            });
         }
 
         writer
-            .write_all(out_slice)
-            .map_err(|e| format!("write error: {e}"))?;
+        .write_all(out_slice)
+        .map_err(|e| format!("write error: {e}"))?;
         bytes_out += enc_len as u64;
         bytes_in += batch_len as u64;
         chunk_idx += count as u64;
@@ -387,9 +387,9 @@ pub fn seal_payload<R: Read, W: Write, F: FnMut(u64)>(
 
     Ok(StreamStats {
         bytes_in,
-        bytes_out,
-        chunks: chunk_idx,
-        header_mac: prepared.header_mac,
+       bytes_out,
+       chunks: chunk_idx,
+       header_mac: prepared.header_mac,
     })
 }
 
@@ -423,12 +423,12 @@ pub fn parse_header(raw: &[u8]) -> Result<HeaderInfo, String> {
 
     Ok(HeaderInfo {
         version,
-        kdf,
-        salt,
-        wrap_nonce,
-        wrapped_key,
-        stream_nonce,
-        header_mac,
+       kdf,
+       salt,
+       wrap_nonce,
+       wrapped_key,
+       stream_nonce,
+       header_mac,
     })
 }
 
@@ -463,9 +463,9 @@ pub fn unlock_header<R: Read>(reader: &mut R, pass: &str) -> Result<UnlockedStre
     let (enc_key, mac_key) = derive_payload_keys(&file_key, &info.stream_nonce);
     Ok(UnlockedStream {
         enc_key,
-        mac_key,
-        stream_nonce: info.stream_nonce,
-        header_mac: info.header_mac,
+       mac_key,
+       stream_nonce: info.stream_nonce,
+       header_mac: info.header_mac,
     })
 }
 
@@ -530,22 +530,22 @@ pub fn open_payload<R: Read, W: Write, F: FnMut(u64)>(
             )
         } else {
             out_slice
-                .par_chunks_mut(CHUNK_SIZE)
-                .enumerate()
-                .try_for_each(|(i, dst)| {
-                    let start = i * ENC_CHUNK_SIZE;
-                    let end = (start + ENC_CHUNK_SIZE).min(batch_len);
-                    let last = is_eof && (i + 1 == count);
-                    decrypt_chunk_into(
-                        &cipher,
-                        &unlocked.mac_key,
-                        &unlocked.stream_nonce,
-                        base_idx + (i as u64),
-                        last,
-                        &slice[start..end],
-                        dst,
-                    )
-                })
+            .par_chunks_mut(CHUNK_SIZE)
+            .enumerate()
+            .try_for_each(|(i, dst)| {
+                let start = i * ENC_CHUNK_SIZE;
+                let end = (start + ENC_CHUNK_SIZE).min(batch_len);
+                let last = is_eof && (i + 1 == count);
+                decrypt_chunk_into(
+                    &cipher,
+                    &unlocked.mac_key,
+                    &unlocked.stream_nonce,
+                    base_idx + (i as u64),
+                                   last,
+                                   &slice[start..end],
+                                   dst,
+                )
+            })
         };
 
         if let Err(e) = res {
@@ -555,8 +555,8 @@ pub fn open_payload<R: Read, W: Write, F: FnMut(u64)>(
 
         if plain_len > 0 {
             writer
-                .write_all(out_slice)
-                .map_err(|e| format!("write error: {e}"))?;
+            .write_all(out_slice)
+            .map_err(|e| format!("write error: {e}"))?;
             bytes_out += plain_len as u64;
             out_slice.zeroize();
         }
@@ -572,9 +572,9 @@ pub fn open_payload<R: Read, W: Write, F: FnMut(u64)>(
 
     Ok(StreamStats {
         bytes_in,
-        bytes_out,
-        chunks: chunk_idx,
-        header_mac: unlocked.header_mac,
+       bytes_out,
+       chunks: chunk_idx,
+       header_mac: unlocked.header_mac,
     })
 }
 
@@ -602,21 +602,21 @@ pub fn bench_stream_pipeline(data: &[u8], out: &mut [u8]) -> [u8; TAG_LEN] {
     let enc_len = data.len() + count * TAG_LEN;
 
     out[..enc_len]
-        .par_chunks_mut(ENC_CHUNK_SIZE)
-        .enumerate()
-        .for_each(|(i, dst)| {
-            let start = i * CHUNK_SIZE;
-            let end = (start + CHUNK_SIZE).min(data.len());
-            encrypt_chunk_into(
-                &cipher,
-                &mac_key,
-                &nonce,
-                i as u64,
-                i + 1 == count,
-                &data[start..end],
-                dst,
-            );
-        });
+    .par_chunks_mut(ENC_CHUNK_SIZE)
+    .enumerate()
+    .for_each(|(i, dst)| {
+        let start = i * CHUNK_SIZE;
+        let end = (start + CHUNK_SIZE).min(data.len());
+        encrypt_chunk_into(
+            &cipher,
+            &mac_key,
+            &nonce,
+            i as u64,
+            i + 1 == count,
+            &data[start..end],
+            dst,
+        );
+    });
 
     let mut tag = [0u8; TAG_LEN];
     tag.copy_from_slice(&out[enc_len - TAG_LEN..enc_len]);
@@ -642,113 +642,113 @@ pub fn hex_short(bytes: &[u8]) -> String {
 }
 
 const B64_CHARS: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
-pub fn b64_encode(input: &[u8]) -> String {
-    let mut out = String::with_capacity(((input.len() + 2) / 3) * 4);
-    for chunk in input.chunks(3) {
-        let b0 = chunk[0];
-        let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
+        pub fn b64_encode(input: &[u8]) -> String {
+            let mut out = String::with_capacity(((input.len() + 2) / 3) * 4);
+            for chunk in input.chunks(3) {
+                let b0 = chunk[0];
+                let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
+                let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
 
-        out.push(B64_CHARS[(b0 >> 2) as usize] as char);
-        out.push(B64_CHARS[(((b0 & 3) << 4) | (b1 >> 4)) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(B64_CHARS[(((b1 & 0xF) << 2) | (b2 >> 6)) as usize] as char);
-        }
-        if chunk.len() > 2 {
-            out.push(B64_CHARS[(b2 & 0x3F) as usize] as char);
-        }
-    }
-    out
-}
-
-pub fn b64_decode(input: &str) -> Result<Vec<u8>, String> {
-    if input.len() % 4 == 1 {
-        return Err("malformed armored token".to_string());
-    }
-
-    let mut out = Vec::with_capacity((input.len() * 3) / 4);
-    let mut buf = 0u32;
-    let mut bits = 0u32;
-
-    for b in input.bytes() {
-        let val = match b {
-            b'A'..=b'Z' => b - b'A',
-            b'a'..=b'z' => b - b'a' + 26,
-            b'0'..=b'9' => b - b'0' + 52,
-            b'-' => 62,
-            b'_' => 63,
-            _ => return Err("malformed armored token".to_string()),
-        };
-        buf = (buf << 6) | (val as u32);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push(((buf >> bits) & 0xFF) as u8);
-        }
-    }
-
-    if bits > 0 && (buf & ((1u32 << bits) - 1)) != 0 {
-        return Err("non-canonical armored token".to_string());
-    }
-
-    Ok(out)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_empty_and_small_stream() {
-        let (sealed_empty, _) = seal_bytes(b"", "pass").unwrap();
-        let (opened_empty, _) = open_bytes(&sealed_empty, "pass").unwrap();
-        assert!(opened_empty.is_empty());
-
-        let msg = b"aes-ni + blake3 + age stream";
-        let (sealed, _) = seal_bytes(msg, "pass").unwrap();
-        let (opened, _) = open_bytes(&sealed, "pass").unwrap();
-        assert_eq!(&*opened, msg);
-        assert!(open_bytes(&sealed, "wrong").is_err());
-    }
-
-    #[test]
-    fn test_multi_chunk_truncation_and_reorder() {
-        let mut data = vec![0u8; CHUNK_SIZE * 2 + 17];
-        for (i, b) in data.iter_mut().enumerate() {
-            *b = (i % 251) as u8;
-        }
-
-        let (sealed, _) = seal_bytes(&data, "stream-pass").unwrap();
-        let (opened, _) = open_bytes(&sealed, "stream-pass").unwrap();
-        assert_eq!(&*opened, &data);
-
-        let truncated = &sealed[..HEADER_LEN + ENC_CHUNK_SIZE];
-        assert!(open_bytes(truncated, "stream-pass").is_err());
-
-        let mut swapped = sealed.clone();
-        let c0 = HEADER_LEN..HEADER_LEN + ENC_CHUNK_SIZE;
-        let c1 = HEADER_LEN + ENC_CHUNK_SIZE..HEADER_LEN + ENC_CHUNK_SIZE * 2;
-        let tmp = swapped[c0.clone()].to_vec();
-        let tmp2 = swapped[c1.clone()].to_vec();
-        swapped[c0].copy_from_slice(&tmp2);
-        swapped[c1].copy_from_slice(&tmp);
-        assert!(open_bytes(&swapped, "stream-pass").is_err());
-    }
-
-    #[test]
-    fn test_canonical_base64() {
-        for len in 0..32 {
-            let mut data = Vec::new();
-            for i in 0..len {
-                data.push((i * 37) as u8);
+                out.push(B64_CHARS[(b0 >> 2) as usize] as char);
+                out.push(B64_CHARS[(((b0 & 3) << 4) | (b1 >> 4)) as usize] as char);
+                if chunk.len() > 1 {
+                    out.push(B64_CHARS[(((b1 & 0xF) << 2) | (b2 >> 6)) as usize] as char);
+                }
+                if chunk.len() > 2 {
+                    out.push(B64_CHARS[(b2 & 0x3F) as usize] as char);
+                }
             }
-            let enc = b64_encode(&data);
-            assert_eq!(b64_decode(&enc).unwrap(), data);
+            out
         }
-        assert!(b64_decode("AB").is_err());
-        assert!(b64_decode("A").is_err());
-        assert!(b64_decode("AA+A").is_err());
-    }
-}
+
+        pub fn b64_decode(input: &str) -> Result<Vec<u8>, String> {
+            if input.len() % 4 == 1 {
+                return Err("malformed armored token".to_string());
+            }
+
+            let mut out = Vec::with_capacity((input.len() * 3) / 4);
+            let mut buf = 0u32;
+            let mut bits = 0u32;
+
+            for b in input.bytes() {
+                let val = match b {
+                    b'A'..=b'Z' => b - b'A',
+                    b'a'..=b'z' => b - b'a' + 26,
+                    b'0'..=b'9' => b - b'0' + 52,
+                    b'-' => 62,
+                    b'_' => 63,
+                    _ => return Err("malformed armored token".to_string()),
+                };
+                buf = (buf << 6) | (val as u32);
+                bits += 6;
+                if bits >= 8 {
+                    bits -= 8;
+                    out.push(((buf >> bits) & 0xFF) as u8);
+                }
+            }
+
+            if bits > 0 && (buf & ((1u32 << bits) - 1)) != 0 {
+                return Err("non-canonical armored token".to_string());
+            }
+
+            Ok(out)
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn test_empty_and_small_stream() {
+                let (sealed_empty, _) = seal_bytes(b"", "pass").unwrap();
+                let (opened_empty, _) = open_bytes(&sealed_empty, "pass").unwrap();
+                assert!(opened_empty.is_empty());
+
+                let msg = b"avx2 + aes-ni + blake3 stream";
+                let (sealed, _) = seal_bytes(msg, "pass").unwrap();
+                let (opened, _) = open_bytes(&sealed, "pass").unwrap();
+                assert_eq!(&*opened, msg);
+                assert!(open_bytes(&sealed, "wrong").is_err());
+            }
+
+            #[test]
+            fn test_multi_chunk_truncation_and_reorder() {
+                let mut data = vec![0u8; CHUNK_SIZE * 2 + 17];
+                for (i, b) in data.iter_mut().enumerate() {
+                    *b = (i % 251) as u8;
+                }
+
+                let (sealed, _) = seal_bytes(&data, "stream-pass").unwrap();
+                let (opened, _) = open_bytes(&sealed, "stream-pass").unwrap();
+                assert_eq!(&*opened, &data);
+
+                let truncated = &sealed[..HEADER_LEN + ENC_CHUNK_SIZE];
+                assert!(open_bytes(truncated, "stream-pass").is_err());
+
+                let mut swapped = sealed.clone();
+                let c0 = HEADER_LEN..HEADER_LEN + ENC_CHUNK_SIZE;
+                let c1 = HEADER_LEN + ENC_CHUNK_SIZE..HEADER_LEN + ENC_CHUNK_SIZE * 2;
+                let tmp = swapped[c0.clone()].to_vec();
+                let tmp2 = swapped[c1.clone()].to_vec();
+                swapped[c0].copy_from_slice(&tmp2);
+                swapped[c1].copy_from_slice(&tmp);
+                assert!(open_bytes(&swapped, "stream-pass").is_err());
+            }
+
+            #[test]
+            fn test_canonical_base64() {
+                for len in 0..32 {
+                    let mut data = Vec::new();
+                    for i in 0..len {
+                        data.push((i * 37) as u8);
+                    }
+                    let enc = b64_encode(&data);
+                    assert_eq!(b64_decode(&enc).unwrap(), data);
+                }
+                assert!(b64_decode("AB").is_err());
+                assert!(b64_decode("A").is_err());
+                assert!(b64_decode("AA+A").is_err());
+            }
+        }

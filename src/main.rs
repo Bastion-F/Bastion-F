@@ -6,6 +6,7 @@ mod ui;
 use crypto::cipher::Knox256;
 use std::env;
 use std::fs::{self, File, OpenOptions};
+use std::hint::black_box;
 use std::io::{self, BufRead, Write};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -122,7 +123,7 @@ fn run_repl() {
 
 fn ask_pass(confirm: bool) -> Result<Zeroizing<String>, String> {
     let p1 = rpassword::prompt_password(format!("  {}passphrase:{} ", ui::MUTED, ui::RESET))
-        .map_err(|e| format!("tty error: {e}"))?;
+    .map_err(|e| format!("tty error: {e}"))?;
     let p1 = Zeroizing::new(p1);
 
     if p1.is_empty() {
@@ -131,7 +132,7 @@ fn ask_pass(confirm: bool) -> Result<Zeroizing<String>, String> {
 
     if confirm {
         let p2 = rpassword::prompt_password(format!("  {}confirm:   {} ", ui::MUTED, ui::RESET))
-            .map_err(|e| format!("tty error: {e}"))?;
+        .map_err(|e| format!("tty error: {e}"))?;
         let p2 = Zeroizing::new(p2);
 
         if p1.as_bytes() != p2.as_bytes() {
@@ -168,8 +169,8 @@ fn create_temp_file(target: &str) -> Result<(File, PathBuf), String> {
     }
 
     let file = opts
-        .open(&tmp_path)
-        .map_err(|e| format!("cannot create temp file '{}': {e}", tmp_path.display()))?;
+    .open(&tmp_path)
+    .map_err(|e| format!("cannot create temp file '{}': {e}", tmp_path.display()))?;
     Ok((file, tmp_path))
 }
 
@@ -189,7 +190,7 @@ fn run_enc(args: &[String]) -> Result<(), String> {
     }
 
     let mut in_file =
-        File::open(input_path).map_err(|e| format!("cannot open '{input_path}': {e}"))?;
+    File::open(input_path).map_err(|e| format!("cannot open '{input_path}': {e}"))?;
     let total_size = in_file.metadata().map(|m| m.len()).unwrap_or(0);
     let pass = ask_pass(true)?;
 
@@ -231,22 +232,22 @@ fn run_enc(args: &[String]) -> Result<(), String> {
     ui::print_line(
         "cipher",
         &format!("KNOX-256 [{}] + Argon2id + BLAKE3", active_backend()),
-        false,
+                   false,
     );
     ui::print_line(
         "size",
         &format!(
             "{} → {} ({} chunks)",
-            ui::format_bytes(stats.bytes_in),
-            ui::format_bytes(stats.bytes_out),
-            stats.chunks
+                 ui::format_bytes(stats.bytes_in),
+                 ui::format_bytes(stats.bytes_out),
+                 stats.chunks
         ),
         false,
     );
     ui::print_done(
         "hdr-mac",
         &format!("{} (sealed)", crypto::hex_short(&stats.header_mac)),
-        start.elapsed(),
+                   start.elapsed(),
     );
     Ok(())
 }
@@ -269,11 +270,11 @@ fn run_dec(args: &[String]) -> Result<(), String> {
     }
 
     let mut in_file =
-        File::open(input_path).map_err(|e| format!("cannot open '{input_path}': {e}"))?;
+    File::open(input_path).map_err(|e| format!("cannot open '{input_path}': {e}"))?;
     let payload_total = in_file
-        .metadata()
-        .map(|m| m.len().saturating_sub(crypto::HEADER_LEN as u64))
-        .unwrap_or(0);
+    .metadata()
+    .map(|m| m.len().saturating_sub(crypto::HEADER_LEN as u64))
+    .unwrap_or(0);
     let pass = ask_pass(false)?;
 
     let start = Instant::now();
@@ -315,16 +316,16 @@ fn run_dec(args: &[String]) -> Result<(), String> {
         "size",
         &format!(
             "{} → {} ({} chunks)",
-            ui::format_bytes(stats.bytes_in),
-            ui::format_bytes(stats.bytes_out),
-            stats.chunks
+                 ui::format_bytes(stats.bytes_in),
+                 ui::format_bytes(stats.bytes_out),
+                 stats.chunks
         ),
         false,
     );
     ui::print_done(
         "hdr-mac",
         &format!("{} (verified)", crypto::hex_short(&stats.header_mac)),
-        start.elapsed(),
+                   start.elapsed(),
     );
     Ok(())
 }
@@ -361,7 +362,7 @@ fn run_open(token: &str) -> Result<(), String> {
     spin.finish();
 
     let text = std::str::from_utf8(&plain)
-        .map_err(|_| "decrypted data is not valid UTF-8".to_string())?;
+    .map_err(|_| "decrypted data is not valid UTF-8".to_string())?;
 
     ui::print_op("open", "armored token verified");
     ui::print_line("output", text, false);
@@ -387,16 +388,16 @@ fn run_info(args: &[String]) -> Result<(), String> {
         "kdf",
         &format!(
             "Argon2id ({} MiB · t={} · p={})",
-            info.kdf.mem_mib(),
-            info.kdf.t_cost,
-            info.kdf.p_cost
+                 info.kdf.mem_mib(),
+                 info.kdf.t_cost,
+                 info.kdf.p_cost
         ),
         false,
     );
     ui::print_line(
         "file",
         &format!("{} (~{} chunks)", ui::format_bytes(meta.len()), chunks),
-        false,
+                   false,
     );
     ui::print_line("salt", &crypto::hex_short(&info.salt), false);
     ui::print_line("nonce", &crypto::hex_short(&info.stream_nonce), false);
@@ -413,13 +414,22 @@ fn run_bench() {
 
     let start = Instant::now();
     let block = cipher.encrypt_chain([0x11u8; 16], tweak, blocks);
-    let single_elapsed = start.elapsed();
-    let single_mib = ((blocks * 16) as f64 / (1024.0 * 1024.0)) / single_elapsed.as_secs_f64();
+    let chain_elapsed = start.elapsed();
+    let chain_mib = ((blocks * 16) as f64 / (1024.0 * 1024.0)) / chain_elapsed.as_secs_f64();
+
+    let mut ctr_buf = vec![0x42u8; 8 * 1024 * 1024];
+    let ctr_start = Instant::now();
+    cipher.ctr_chunk(&tweak, 0, false, &mut ctr_buf);
+    black_box(&ctr_buf);
+    let ctr_elapsed = ctr_start.elapsed();
+    let ctr_mib = 8.0 / ctr_elapsed.as_secs_f64();
 
     let size = 64 * 1024 * 1024;
     let chunks = size / crypto::CHUNK_SIZE;
     let buf = vec![0x42u8; size];
-    let mut out = vec![0u8; size + chunks * crypto::TAG_LEN];
+    let mut out = vec![1u8; size + chunks * crypto::TAG_LEN];
+
+    let _ = crypto::bench_stream_pipeline(&buf[..crypto::CHUNK_SIZE * 16], &mut out);
 
     let stream_start = Instant::now();
     let last_tag = crypto::bench_stream_pipeline(&buf, &mut out);
@@ -444,21 +454,32 @@ fn run_bench() {
 
     spin.finish();
 
+    let profile = if cfg!(debug_assertions) {
+        "DEBUG — rebuild with --release!"
+    } else {
+        "release"
+    };
+
     ui::print_op(
         "bench",
-        &format!("KNOX-256 [{}] + BLAKE3 STREAM", cipher.backend_name()),
+        &format!("KNOX-256 [{}] + BLAKE3 ({profile})", cipher.backend_name()),
     );
-    ui::print_line("1-thread", &format!("{single_mib:.1} MiB/s ({blocks} blocks)"), false);
+    ui::print_line(
+        "1t-chain",
+        &format!("{chain_mib:.1} MiB/s (serial latency, {blocks} blocks)"),
+                   false,
+    );
+    ui::print_line("1t-ctr", &format!("{ctr_mib:.1} MiB/s (8 MiB single-core)"), false);
     ui::print_line(
         "stream",
         &format!("{stream_mib:.1} MiB/s (64 MiB enc+MAC on {threads} threads)"),
-        false,
+                   false,
     );
     ui::print_line("avalanche", &format!("{avg:.2}% bit flip per 1-bit delta"), false);
     ui::print_done(
         "checksum",
         &format!("{} · {}", crypto::hex_short(&block), crypto::hex_short(&last_tag)),
-        single_elapsed + stream_elapsed,
+                   chain_elapsed + ctr_elapsed + stream_elapsed,
     );
 }
 

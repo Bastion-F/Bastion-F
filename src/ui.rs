@@ -128,11 +128,11 @@ impl Progress {
             }
         } else if done < self.total
             && now.duration_since(self.last_draw) < Duration::from_millis(33)
-        {
-            return;
-        }
+            {
+                return;
+            }
 
-        self.visible = true;
+            self.visible = true;
         self.last_draw = now;
 
         let clamped = done.min(self.total);
@@ -196,7 +196,7 @@ fn format_rate(bytes: u64, elapsed: Duration) -> String {
 
 pub fn print_banner(cwd: &str, backend: &str) {
     println!();
-    println!("  {ACCENT}▐▛███▜▌{RESET}    {BOLD}{TEXT}knox{RESET} {MUTED}v0.6.1-HOT{RESET}");
+    println!("  {ACCENT}▐▛███▜▌{RESET}    {BOLD}{TEXT}knox{RESET} {MUTED}v0.7.0{RESET}");
     println!("  {ACCENT}▜█████▛▘{RESET}   {MUTED}KNOX-256 [{backend}] · Argon2id · BLAKE3 · STREAM{RESET}");
     println!("   {ACCENT}▘▘ ▝▝{RESET}     {MUTED}constant-time · 0600 atomic I/O · {cwd}{RESET}");
     println!();
